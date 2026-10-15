@@ -270,16 +270,16 @@ impl Ns7ii {
         info!("firmware reply (0x56, 8 bytes): {v:02x?}");
         let mut info = requests::decode_firmware_version(&v)?;
         match self.control(&requests::firmware_topology()) {
-            Ok(t) => match {
+            Ok(t) => {
                 info!("topology reply (0x56, 5 bytes): {t:02x?}");
-                requests::decode_firmware_topology(&t)
-            } {
+                match requests::decode_firmware_topology(&t) {
                 Ok((i, o)) => {
                     info.in_channels = i;
                     info.out_channels = o;
                 }
-                Err(e) => warn!("topology reply too short: {e}"),
-            },
+                    Err(e) => warn!("topology reply too short: {e}"),
+                }
+            }
             Err(e) => warn!("topology request failed (not fatal): {e}"),
         }
         Ok(info)
