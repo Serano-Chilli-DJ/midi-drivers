@@ -147,7 +147,11 @@ fn ctrl_c_flag() -> Arc<AtomicBool> {
     let _ = FLAG.set(f);
     extern "C" fn on_sigint(_: i32) {
         if let Some(f) = FLAG.get() {
-            f.store(true, Ordering::SeqCst);
+            if f.swap(true, Ordering::SeqCst) {
+                // Second Ctrl-C: give up waiting for streams to drain.
+                // SAFETY: _exit is async-signal-safe.
+                unsafe { libc::_exit(130) };
+            }
         }
     }
     // SAFETY: installing an async-signal-safe handler that only stores an atomic.

@@ -63,8 +63,10 @@ pub const STATUS_READY: u8 = 0x20;
 /// First firmware probe: `0xC0 0x56 wValue=0 wIndex=0 wLength=8`. **confirmed**.
 ///
 /// The kext decodes the reply as
-/// `version = b[0] | (b[1]_decimal_tens << 16 | b[1]_decimal_ones << 8) | b[2] << 24`
-/// where `b[1]` is split into tens and ones (`b[1] / 10`, `b[1] % 10`).
+/// `version = b[0] | (b[2]_ones << 8) | (b[2]_tens << 16) | (b[1] << 24)`
+/// where `b[2]` is split into tens and ones (`b[2] / 10`, `b[2] % 10`), so
+/// the human-readable form is `b[1].tens.ones`. Verified on hardware:
+/// reply `31 01 00 ..` = firmware 1.0.0, chip 0x31.
 pub fn firmware_version() -> ControlRequest {
     ControlRequest {
         request_type: request_type::VENDOR_IN,
@@ -78,8 +80,9 @@ pub fn firmware_version() -> ControlRequest {
 /// Second firmware probe: `0xC0 0x56 wValue=0 wIndex=0 wLength=5`. **confirmed**
 /// for Numark PIDs 0x26, 0x2C, 0x40, 0x70..0x79 and Alesis 0x13B2:0x0030.
 ///
-/// The kext reads `in_channels = (b[2] & 0x7F) * 2` and
-/// `out_channels = (b[3] & 0x7F) * 2` from the reply.
+/// The kext stores `(b[3] & 0x7F) * 2` as the output channel count and
+/// `(b[4] & 0x7F) * 2` as the input channel count. Verified on hardware:
+/// `b[3] = 2` gives the 4 outputs the official table also lists.
 pub fn firmware_topology() -> ControlRequest {
     ControlRequest {
         request_type: request_type::VENDOR_IN,
@@ -97,7 +100,7 @@ pub struct FirmwareInfo {
     pub chip_id: u8,
     /// Version as the kext packs it (`Scanned Firmware Version is :%08X`).
     pub packed_version: u32,
-    /// Human-readable `major.minor.patch` guess: `b[2].b[1]/10.b[1]%10`.
+    /// Human-readable `major.minor.patch`: `b[1].b[2]/10.b[2]%10`.
     pub version_string: String,
     /// Capture channel count reported by the device (0 if the 5-byte probe failed).
     pub in_channels: u8,
@@ -123,27 +126,27 @@ pub fn decode_firmware_version(reply: &[u8]) -> Result<FirmwareInfo, DecodeError
     if reply.len() < 3 {
         return Err(DecodeError::TooShort { got: reply.len(), need: 3 });
     }
-    let tens = reply[1] / 10;
-    let ones = reply[1] % 10;
+    let tens = reply[2] / 10;
+    let ones = reply[2] % 10;
     let packed = (reply[0] as u32)
         | ((ones as u32) << 8)
         | ((tens as u32) << 16)
-        | ((reply[2] as u32) << 24);
+        | ((reply[1] as u32) << 24);
     Ok(FirmwareInfo {
         chip_id: reply[0],
         packed_version: packed,
-        version_string: format!("{}.{}.{}", reply[2], tens, ones),
+        version_string: format!("{}.{}.{}", reply[1], tens, ones),
         in_channels: 0,
         out_channels: 0,
     })
 }
 
-/// Decode the 5-byte reply to [`firmware_topology`] into channel counts.
+/// Decode the 5-byte reply to [`firmware_topology`] into `(in, out)` channel counts.
 pub fn decode_firmware_topology(reply: &[u8]) -> Result<(u8, u8), DecodeError> {
-    if reply.len() < 4 {
-        return Err(DecodeError::TooShort { got: reply.len(), need: 4 });
+    if reply.len() < 5 {
+        return Err(DecodeError::TooShort { got: reply.len(), need: 5 });
     }
-    Ok(((reply[2] & 0x7F) * 2, (reply[3] & 0x7F) * 2))
+    Ok(((reply[4] & 0x7F) * 2, (reply[3] & 0x7F) * 2))
 }
 
 /// Read the status register: `0xC0 0x49 wValue=0 wIndex=idx wLength=1`. **family**.
@@ -230,15 +233,19 @@ mod tests {
 
     #[test]
     fn firmware_version_packing_matches_kext() {
-        // b[0]=0x12 chip, b[1]=37 -> 3.7, b[2]=1 -> "1.3.7"
-        let info = decode_firmware_version(&[0x12, 37, 1, 0, 0, 0, 0, 0]).unwrap();
+        // b[0]=0x12 chip, b[1]=1 major, b[2]=37 -> 3.7 -> "1.3.7"
+        let info = decode_firmware_version(&[0x12, 1, 37, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(info.version_string, "1.3.7");
         assert_eq!(info.packed_version, 0x0103_0712);
+        // Real NS7II reply (2026-10-15): 31 01 00 -> 1.0.0, packed 0x0100_0031
+        let real = decode_firmware_version(&[0x31, 0x01, 0x00, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(real.version_string, "1.0.0");
+        assert_eq!(real.packed_version, 0x0100_0031);
     }
 
     #[test]
     fn topology_doubles_masked_bytes() {
-        assert_eq!(decode_firmware_topology(&[0, 0, 0x86, 0x02, 0]).unwrap(), (12, 4));
+        assert_eq!(decode_firmware_topology(&[0, 0, 0, 0x02, 0x86]).unwrap(), (12, 4));
     }
 
     #[test]

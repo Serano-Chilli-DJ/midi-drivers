@@ -267,9 +267,13 @@ impl Ns7ii {
     /// Firmware version and reported channel topology (vendor request 0x56).
     pub fn firmware_info(&self) -> Result<FirmwareInfo> {
         let v = self.control(&requests::firmware_version())?;
+        info!("firmware reply (0x56, 8 bytes): {v:02x?}");
         let mut info = requests::decode_firmware_version(&v)?;
         match self.control(&requests::firmware_topology()) {
-            Ok(t) => match requests::decode_firmware_topology(&t) {
+            Ok(t) => match {
+                info!("topology reply (0x56, 5 bytes): {t:02x?}");
+                requests::decode_firmware_topology(&t)
+            } {
                 Ok((i, o)) => {
                     info.in_channels = i;
                     info.out_channels = o;

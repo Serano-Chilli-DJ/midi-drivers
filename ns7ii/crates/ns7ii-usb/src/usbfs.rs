@@ -376,7 +376,8 @@ pub struct Urb {
     packets: usize,
     buffer: Vec<u8>,
     in_flight: bool,
-    /// Opaque value returned by `reap` so callers can find this URB again.
+    /// Value returned by `reap` for this URB: the address of the kernel-visible
+    /// URB structure (usbfs reports completions by that pointer).
     pub token: usize,
 }
 
@@ -398,20 +399,21 @@ impl std::fmt::Debug for Urb {
 impl Urb {
     /// Allocate a URB for `endpoint` (direction bit included) of `typ`, with a
     /// buffer of `len` bytes and `packets` isochronous packet descriptors
-    /// (0 for bulk/interrupt).
-    pub fn new(typ: u8, endpoint: u8, len: usize, packets: usize, token: usize) -> Self {
+    /// (0 for bulk/interrupt). `tag` is stored in `usercontext` for debugging.
+    pub fn new(typ: u8, endpoint: u8, len: usize, packets: usize, tag: usize) -> Self {
         let size = std::mem::size_of::<UrbHeader>() + packets * std::mem::size_of::<IsoPacketDesc>();
         let layout = Layout::from_size_align(size.max(1), std::mem::align_of::<UrbHeader>())
             .expect("valid URB layout");
         // SAFETY: layout has non-zero size; the block is freed in Drop with the same layout.
         let block = unsafe { alloc_zeroed(layout) };
         assert!(!block.is_null(), "URB allocation failed");
+        let token = block as usize;
         let mut urb = Self { block, layout, packets, buffer: vec![0u8; len], in_flight: false, token };
         let h = urb.header_mut();
         h.typ = typ;
         h.endpoint = endpoint;
         h.number_of_packets = packets as i32;
-        h.usercontext = token as *mut libc::c_void;
+        h.usercontext = tag as *mut libc::c_void;
         urb.sync_buffer_ptr();
         urb
     }
@@ -560,7 +562,7 @@ mod tests {
         }
         assert_eq!(u.header().number_of_packets, 3);
         assert_eq!(u.header().buffer_length, 1536);
-        assert_eq!(u.token, 7);
+        assert_eq!(u.token, u.block as usize);
         assert_eq!(u.endpoint(), 0x05);
     }
 }
