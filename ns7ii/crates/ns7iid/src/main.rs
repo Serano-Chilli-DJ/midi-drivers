@@ -523,18 +523,85 @@ fn run_daemon(
         }
     }
 
+    // Audio streams always run: the firmware forwards MIDI only while
+    // streaming. Without --pcm-in the capture data is discarded; without
+    // --pcm-out silence is played.
+    let in_ch = if fw.in_channels > 0 { fw.in_channels as usize } else { 12 };
+    let out_ch = if fw.out_channels > 0 { fw.out_channels as usize } else { 4 };
+    let in_codec = make_codec(cli.codec, in_ch, out_ch);
+    let out_codec = make_codec(cli.codec, in_ch, out_ch);
+    let is_junction = matches!(cli.codec, Codec::Junction);
+
+    // Playback: ALSA PCM (apps play into the other side of a loopback) -> device.
+    {
+        let ep = ns.plan().playback.clone().ok_or("no playback endpoint; pass --play-ep")?;
+        let frame_bytes = out_codec.out_frame_bytes();
+        let source = AudioSource::new();
+        let cfg = IsoOutConfig { rate: cli.rate, frame_bytes, packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
+        let (fb_tx, fb_rx) = mpsc::channel();
+        let fb_id = match &ns.plan().feedback {
+            Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+            None => None,
+        };
+        let stream = ns.start_iso_out(&ep, cfg, source.clone())?;
+        let ns2 = Arc::clone(&ns);
+        let stop2 = Arc::clone(&stop);
+        let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
+        let mut pcm = match &pcm_out {
+            Some(name) => Some(alsa.open_pcm(name, true, out_ch as u32, cli.rate, 50_000)?),
+            None => None,
+        };
+        let rate = cli.rate;
+        threads.push(std::thread::spawn(move || {
+            let period = 256usize;
+            let mut in_bytes = vec![0u8; period * out_ch * 3];
+            let mut samples = vec![0i32; period * out_ch];
+            let mut wire = vec![0u8; period * frame_bytes];
+            // Keep roughly 20 ms queued ahead of the USB side.
+            let target = (rate as usize / 50) * frame_bytes;
+            while !stop2.load(Ordering::SeqCst) {
+                while let Ok(fp) = fb_rx.try_recv() {
+                    log::debug!("feedback {}.{:04x}", fp >> 16, fp & 0xFFFF);
+                }
+                let Some(pcm) = pcm.as_mut() else {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+                if source.queued() > target {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                match pcm.read(&mut in_bytes) {
+                    Ok(n) => {
+                        let got = plain.decode(&in_bytes[..n], &mut samples);
+                        let m = out_codec.encode(&samples[..got], &mut wire);
+                        source.push(&wire[..m]);
+                    }
+                    Err(e) => {
+                        warn!("pcm read: {e}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            ns2.stop(stream.id);
+            if let Some(id) = fb_id {
+                ns2.stop(id);
+            }
+        }));
+    }
+
     // Capture: device -> ALSA PCM (apps record from the other side of a loopback).
-    if let Some(name) = pcm_in {
-        let in_ch = if fw.in_channels > 0 { fw.in_channels as usize } else { 12 };
+    {
         let ep = ns.plan().capture.clone().ok_or("no capture endpoint; pass --capture-ep")?;
-        let mut pcm = alsa.open_pcm(&name, false, in_ch as u32, cli.rate, 50_000)?;
-        let codec = make_codec(cli.codec, in_ch, 0);
-        let frame_bytes = codec.in_frame_bytes();
+        let mut pcm = match &pcm_in {
+            Some(name) => Some(alsa.open_pcm(name, false, in_ch as u32, cli.rate, 50_000)?),
+            None => None,
+        };
+        let frame_bytes = in_codec.in_frame_bytes();
         let packets = if ep.kind == EndpointKind::Interrupt { 8 } else { 16 };
         let stream = ns.start_bulk_in(&ep, 4, packets)?;
         let ns2 = Arc::clone(&ns);
         let stop2 = Arc::clone(&stop);
-        let is_junction = matches!(cli.codec, Codec::Junction);
         threads.push(std::thread::spawn(move || {
             let mut pending = Vec::new();
             let mut samples = vec![0i32; 8192 * in_ch];
@@ -543,13 +610,14 @@ fn run_daemon(
             while !stop2.load(Ordering::SeqCst) {
                 match stream.rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(raw) => {
+                        let Some(pcm) = pcm.as_mut() else { continue };
                         pending.extend_from_slice(&raw);
                         let usable = pending.len() - pending.len() % frame_bytes;
                         let frames = usable / frame_bytes;
                         if samples.len() < frames * in_ch {
                             samples.resize(frames * in_ch, 0);
                         }
-                        let n = codec.decode(&pending[..usable], &mut samples[..frames * in_ch]);
+                        let n = in_codec.decode(&pending[..usable], &mut samples[..frames * in_ch]);
                         let n_samples = if is_junction { n * in_ch } else { n };
                         out_bytes.resize(n_samples * 3, 0);
                         plain.encode(&samples[..n_samples], &mut out_bytes);
@@ -566,58 +634,6 @@ fn run_daemon(
         }));
     }
 
-    // Playback: ALSA PCM (apps play into the other side of a loopback) -> device.
-    if let Some(name) = pcm_out {
-        let out_ch = if fw.out_channels > 0 { fw.out_channels as usize } else { 4 };
-        let ep = ns.plan().playback.clone().ok_or("no playback endpoint; pass --play-ep")?;
-        let mut pcm = alsa.open_pcm(&name, true, out_ch as u32, cli.rate, 50_000)?;
-        let codec = make_codec(cli.codec, 0, out_ch);
-        let frame_bytes = codec.out_frame_bytes();
-        let source = AudioSource::new();
-        let cfg = IsoOutConfig { rate: cli.rate, frame_bytes, packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
-        let (fb_tx, fb_rx) = mpsc::channel();
-        let fb_id = match &ns.plan().feedback {
-            Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
-            None => None,
-        };
-        let stream = ns.start_iso_out(&ep, cfg, source.clone())?;
-        let ns2 = Arc::clone(&ns);
-        let stop2 = Arc::clone(&stop);
-        let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
-        threads.push(std::thread::spawn(move || {
-            let period = 256usize;
-            let mut in_bytes = vec![0u8; period * out_ch * 3];
-            let mut samples = vec![0i32; period * out_ch];
-            let mut wire = vec![0u8; period * frame_bytes];
-            // Keep roughly 20 ms queued ahead of the USB side.
-            let target = (cli_rate(&ns2) as usize / 50) * frame_bytes;
-            while !stop2.load(Ordering::SeqCst) {
-                while let Ok(fp) = fb_rx.try_recv() {
-                    log::debug!("feedback {}.{:04x}", fp >> 16, fp & 0xFFFF);
-                }
-                if source.queued() > target {
-                    std::thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                match pcm.read(&mut in_bytes) {
-                    Ok(n) => {
-                        let got = plain.decode(&in_bytes[..n], &mut samples);
-                        let m = codec.encode(&samples[..got], &mut wire);
-                        source.push(&wire[..m]);
-                    }
-                    Err(e) => {
-                        warn!("pcm read: {e}");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-            }
-            ns2.stop(stream.id);
-            if let Some(id) = fb_id {
-                ns2.stop(id);
-            }
-        }));
-    }
-
     println!("running; Ctrl-C to stop");
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));
@@ -626,10 +642,6 @@ fn run_daemon(
         let _ = t.join();
     }
     Ok(())
-}
-
-fn cli_rate(_ns: &Ns7ii) -> u32 {
-    44_100
 }
 
 fn hex(b: &[u8]) -> String {
