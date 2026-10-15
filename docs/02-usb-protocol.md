@@ -17,22 +17,28 @@ here has been verified against a live NS7II yet.
     device exposes a class MIDIStreaming interface, which the driver also
     knows how to bind (`findMidiInterface` looks for class 1 / subclass 3).
 
-## Expected descriptor layout (assumed until `probe` runs)
-
-By analogy with the Xone family and the kext's pipe assignment:
+## Descriptor layout (**confirmed** by `ns7iid probe` on real hardware, 2026-10-15)
 
 ```
-Interface 0  class FF  alt 0: no endpoints
-             class FF  alt 1: EP 0x0n OUT isochronous (playback, adaptive or async)
-                              EP 0x8n IN  isochronous, wMaxPacketSize 3 or 4 (feedback)
-                              EP 0x8n IN  bulk 512 (raw MIDI in)
-                              EP 0x0n OUT bulk 512 (raw MIDI out)
-Interface 1  class FF  alt 1: EP 0x8n IN  bulk 512 (capture)
-Interface 2  class 01/03 (optional USB-MIDI class interface)
+Device: USB 2.00, class FF/FF/FF, bcdDevice 0x0200, high speed (480 Mbit/s), self-powered
+Configuration 1
+  Interface 0  class FF  alt 0: no endpoints
+               class FF  alt 1: EP 0x02 OUT isochronous, wMaxPacketSize 156, bInterval 1, asynchronous  (playback)
+                                EP 0x83 IN  bulk 512                                                     (raw MIDI in)
+                                EP 0x04 OUT bulk 512                                                     (raw MIDI out)
+  Interface 1  class FF  alt 0: no endpoints
+               class FF  alt 1: EP 0x81 IN  isochronous, wMaxPacketSize 64, bInterval 4 (1 ms)            (feedback/status, format open)
+                                EP 0x86 IN  bulk 512, bInterval 1                                         (capture)
 ```
 
-`ns7iid probe` prints the real layout and the plan it derives; every endpoint
-can be overridden on the command line.
+Raw: `12 01 00 02 ff ff ff 40 e4 15 2c 00 00 02 01 02 03 01 09 02 50 00 02 01 00 40 00 09 04 00 00 00 ff 00 00 00 09 04 00 01 03 ff 00 00 00 07 05 02 05 9c 00 01 07 05 83 02 00 02 04 07 05 04 02 00 02 04 09 04 01 00 00 ff 00 00 00 09 04 01 01 02 ff 00 00 00 07 05 81 05 40 00 04 07 05 86 02 00 02 01`
+
+No class MIDI interface, so MIDI goes through the driver. 156 bytes per
+microframe is 13 frames of 4 channels x 3 bytes: the playback endpoint is
+sized for 4 channels of 24-bit at up to 96 kHz, which supports the plain
+24-bit 4-output conclusion below. The 64-byte isochronous IN endpoint is
+larger than a UAC feedback endpoint (3-4 bytes); its content is still to be
+captured (`RUST_LOG=debug` logs it).
 
 ## Control requests (endpoint 0)
 
