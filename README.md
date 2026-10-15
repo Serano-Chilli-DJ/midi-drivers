@@ -63,18 +63,40 @@ the driver builds one from the unit itself:
 
 ```
 systemctl stop ns7iid                      # the service holds the device
-ns7iid midi-learn                          # ~5 minutes: touch each control when asked
-ns7iid mixxx-map --out-dir ~/.mixxx/controllers
+ns7iid midi-learn                          # ~10 minutes: touch each control when asked
+ns7iid mixxx-map                           # writes the mapping into Mixxx's controller folder
 systemctl start ns7iid
 ```
 
-`midi-learn` captures deck 1 completely and a few controls on decks 2 to 4
-and the other mixer channels to learn the numbering scheme; `mixxx-map`
-extrapolates the rest and writes `Numark NS7II.midi.xml` plus
-`Numark-NS7II-scripts.js` (platter scratching, strip search, pads in hot
-cue / loop / beat-jump / sampler modes, loops, FX, mixer, library, LEDs).
-Restart Mixxx and pick the "Numark NS7II" mapping in Preferences, Controllers.
-The capture is saved to `ns7ii-learn.json` and can be resumed or edited.
+`midi-learn` captures deck 1 completely, a few controls on decks 2 to 4 to
+learn the numbering, and all four mixer strips (the NS7II numbers them
+irregularly, so they cannot be extrapolated). The capture is saved to
+`ns7ii-learn.json` after every control; quit with `q` and run it again to
+resume, and delete an entry from the file to redo that control. Anything
+you skip is simply left out of the mapping, and `mixxx-map` lists what is
+still missing.
+
+`mixxx-map` writes `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js`
+into the folder Mixxx scans for user mappings:
+
+| Mixxx install | folder |
+|---------------|--------|
+| native package / AppImage | `~/.mixxx/controllers/` |
+| Flatpak | `~/.var/app/org.mixxx.Mixxx/.mixxx/controllers/` |
+| Snap | `~/snap/mixxx/current/.mixxx/controllers/` |
+
+It picks whichever of these settings folders exists; `--out-dir` overrides
+it. Mixxx reads the folder only at start-up, so restart Mixxx afterwards,
+make sure the driver is running (the controller only appears in Mixxx
+while `ns7iid` runs), open Preferences, Controllers, click "Numark NS7II" in
+the list on the left, choose "Numark NS7II" under Load Mapping, tick
+Enabled and Apply.
+
+The mapping covers platter scratching, strip search, pads in hot cue / loop
+/ beat-jump / sampler modes, loops, FX, mixer, library and LEDs. Decks 3
+and 4 are only mapped if their captures differ from decks 1 and 2, i.e. the
+DECK layer button was pressed during `midi-learn`; the tool warns at
+capture time if it was not.
 
 ## One correction to the premise
 

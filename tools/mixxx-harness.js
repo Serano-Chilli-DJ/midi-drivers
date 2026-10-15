@@ -39,15 +39,17 @@ while ((m = re.exec(xml))) {
   }
 }
 // Mode switches and pads under each mode, shift, platter touch+turn.
+// A partial capture leaves components out; only exercise the ones present.
 const d = ctx.NS7II.decks[0];
+const press = (c) => { if (d[c]) { d[c].input(0, 0, 0x7F, 0x90, '[Channel1]'); d[c].input(0, 0, 0, 0x90, '[Channel1]'); } };
 for (const mode of ['hotcue', 'loop', 'slicer', 'sampler']) {
   d.setPadMode(mode);
-  for (let i = 1; i <= 8; i++) { d['pad' + i].input(0, 0, 0x7F, 0x90, '[Channel1]'); d['pad' + i].input(0, 0, 0, 0x90, '[Channel1]'); }
+  for (let i = 1; i <= 8; i++) { press('pad' + i); }
 }
-ctx.NS7II.setShift(0, true); d.pad1.input(0, 0, 0x7F, 0x90, '[Channel1]'); ctx.NS7II.setShift(0, false);
-d.platterTouch.input(0, 0, 0x7F, 0x90, '[Channel1]');
-for (let i = 0; i < 10; i++) d.platterTurn.input(0, 6, 66);
-d.platterTouch.input(0, 0, 0, 0x90, '[Channel1]');
+ctx.NS7II.setShift(0, true); press('pad1'); ctx.NS7II.setShift(0, false);
+if (d.platterTouch) { d.platterTouch.input(0, 0, 0x7F, 0x90, '[Channel1]'); }
+if (d.platterTurn) { for (let i = 0; i < 10; i++) d.platterTurn.input(0, 6, 66); }
+if (d.platterTouch) { d.platterTouch.input(0, 0, 0, 0x90, '[Channel1]'); }
 vm.runInContext('NS7II.shutdown();', ctx);
 const ticks = log.filter(l => l[0] === 'tick').length;
 const sets = log.filter(l => l[0] === 'set' || l[0] === 'setp').length;

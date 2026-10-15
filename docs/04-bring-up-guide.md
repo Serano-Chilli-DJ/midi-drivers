@@ -106,15 +106,23 @@ at the "Numark NS7II" MIDI ports. PipeWire users can instead use
 
 ```
 systemctl stop ns7iid
-ns7iid midi-learn                 # follow the prompts; Enter skips, r redoes, q saves and quits
-ns7iid mixxx-map --out-dir ~/.mixxx/controllers
+ns7iid midi-learn                 # follow the prompts; Enter skips, r redoes, s skips the section, q saves and quits
+ns7iid mixxx-map                  # into ~/.mixxx/controllers (or the Flatpak / Snap folder); --out-dir overrides
 systemctl start ns7iid
 ```
 
-Then restart Mixxx and select "Numark NS7II" for the controller. If a control
-behaves wrongly, delete its entry from `ns7ii-learn.json`, run `midi-learn`
-again (it resumes), and regenerate. Settings such as pitch fader direction
-and platter resolution are at the top of `Numark-NS7II-scripts.js`.
+`mixxx-map` prints what it mapped and which controls the capture still
+lacks; run `midi-learn` again to add them (it only asks for what is
+missing) and regenerate. Then start the driver, restart Mixxx, open
+Preferences, Controllers, click "Numark NS7II" on the left and pick the
+"Numark NS7II" mapping under Load Mapping. If a control behaves wrongly,
+delete its entry from `ns7ii-learn.json`, run `midi-learn` again and
+regenerate. Settings such as pitch fader direction and platter resolution
+are at the top of `Numark-NS7II-scripts.js`.
+
+Decks 3 and 4: when their PLAY capture equals deck 1's or deck 2's, the
+DECK layer button had no effect (or was not pressed) and those decks are
+left unmapped rather than driving two Mixxx decks at once.
 
 ## What to send back
 

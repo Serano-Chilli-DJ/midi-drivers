@@ -92,8 +92,10 @@ enum Cmd {
         #[arg(default_value = "ns7ii-learn.json")]
         input: String,
         /// Directory to write `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js` into.
-        #[arg(long, default_value = ".")]
-        out_dir: String,
+        /// Default: this user's Mixxx controller folder (`~/.mixxx/controllers`, or the
+        /// Flatpak / Snap equivalent, whichever exists).
+        #[arg(long)]
+        out_dir: Option<String>,
     },
     /// Record capture audio to a WAV file.
     Record {
@@ -184,6 +186,19 @@ fn ctrl_c_flag() -> Arc<AtomicBool> {
         libc::signal(libc::SIGTERM, on_sigint as *const () as usize);
     }
     flag
+}
+
+/// Mixxx's user controller folder: `<settings>/controllers`, where the
+/// settings folder is `~/.mixxx` for a native install, or the Flatpak / Snap
+/// sandbox equivalent. Only an existing settings folder counts, so the files
+/// never land where Mixxx would not look.
+fn mixxx_controllers_dir() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    [".mixxx", ".var/app/org.mixxx.Mixxx/.mixxx", "snap/mixxx/current/.mixxx"]
+        .iter()
+        .map(|d| format!("{home}/{d}"))
+        .find(|d| std::path::Path::new(d).is_dir())
+        .map(|d| format!("{d}/controllers"))
 }
 
 fn open(cli: &Cli) -> Result<Ns7ii, Box<dyn std::error::Error>> {
@@ -356,19 +371,30 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ns.stop(stream.id);
             audio.stop(&ns);
             result?;
-            println!("next: ns7iid mixxx-map {out} --out-dir ~/.mixxx/controllers");
+            println!("next: ns7iid mixxx-map {out}      (writes the mapping into your Mixxx controllers folder)");
             Ok(())
         }
         Cmd::MixxxMap { input, out_dir } => {
             let learned = learn::Learned::load(input)?;
-            let (xml, js) = mixxx::generate(&learned)?;
-            std::fs::create_dir_all(out_dir)?;
+            let (xml, js, notes) = mixxx::generate(&learned)?;
+            let out_dir = match out_dir {
+                Some(d) => d.clone(),
+                None => mixxx_controllers_dir().ok_or(
+                    "no Mixxx settings folder found (~/.mixxx, Flatpak or Snap); start Mixxx once or pass --out-dir",
+                )?,
+            };
+            std::fs::create_dir_all(&out_dir)?;
             let xml_path = format!("{out_dir}/Numark NS7II.midi.xml");
             let js_path = format!("{out_dir}/Numark-NS7II-scripts.js");
             std::fs::write(&xml_path, xml)?;
             std::fs::write(&js_path, js)?;
+            for n in &notes {
+                println!("{n}");
+            }
             println!("wrote {xml_path}\nwrote {js_path}");
-            println!("Restart Mixxx, open Preferences > Controllers > Numark NS7II and select the \"Numark NS7II\" mapping.");
+            println!("Now: start the driver (systemctl start ns7iid), start Mixxx, open Preferences > Controllers,");
+            println!("click \"Numark NS7II\" in the left list, choose \"Numark NS7II\" under Load Mapping, enable, Apply.");
+            println!("Mixxx reads this folder only at start-up, so restart it if it was running.");
             Ok(())
         }
         Cmd::MidiSend { bytes } => {
