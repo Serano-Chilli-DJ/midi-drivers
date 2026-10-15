@@ -1,0 +1,4 @@
+# Numark NS7II (Ploytec USB audio): let the logged-in user open the raw device
+# node so ns7iid can run without root. Install to /etc/udev/rules.d/ and run
+# `sudo udevadm control --reload && sudo udevadm trigger`.
+SUBSYSTEM=="usb", ATTR{idVendor}=="15e4", ATTR{idProduct}=="002c", MODE="0660", TAG+="uaccess", GROUP="audio"

@@ -1,0 +1,13 @@
+[package]
+name = "ns7ii-usb"
+description = "USB transport for the Numark NS7II: enumeration, descriptors, control/bulk via nusb, isochronous via a small pure-Rust usbfs layer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ns7ii-proto.workspace = true
+nusb.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+log.workspace = true

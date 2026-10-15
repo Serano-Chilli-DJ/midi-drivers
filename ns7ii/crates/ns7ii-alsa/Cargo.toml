@@ -1,0 +1,12 @@
+[package]
+name = "ns7ii-alsa"
+description = "Minimal safe wrapper over libasound (loaded at runtime with libloading): sequencer MIDI ports and PCM playback/capture. No ALSA headers needed to build."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+log.workspace = true

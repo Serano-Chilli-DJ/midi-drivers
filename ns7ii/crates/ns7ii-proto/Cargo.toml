@@ -1,0 +1,9 @@
+[package]
+name = "ns7ii-proto"
+description = "Numark NS7II (Ploytec) USB protocol: constants, control requests, PCM codecs, MIDI framing. No I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

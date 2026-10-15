@@ -1,0 +1,565 @@
+//! `ns7iid`: Numark NS7II user-space driver and diagnostics.
+//!
+//! Staged by design. Each subcommand proves one layer on real hardware and
+//! prints what the next stage needs:
+//!
+//! 1. `list` / `probe`: find the device, dump descriptors and the endpoint plan.
+//! 2. `handshake`: firmware version, channel counts, status, sample rate.
+//! 3. `midi-dump` / `midi-send`: raw MIDI over the Ploytec bulk pipes.
+//! 4. `record`: capture audio to a WAV file; `play`: play a WAV or test tone.
+//! 5. `run`: the daemon — ALSA sequencer MIDI ports plus PCM bridging.
+
+use clap::{Parser, Subcommand, ValueEnum};
+use log::{info, warn};
+use ns7ii_proto::midi::{strip_filler, RunningStatusExpander};
+use ns7ii_proto::pcm::{self, Junction, Plain24, WireCodec};
+use ns7ii_usb::descriptors::EndpointKind;
+use ns7ii_usb::{AudioSource, IsoOutConfig, Ns7ii, Overrides};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+#[derive(Parser)]
+#[command(name = "ns7iid", version, about = "Numark NS7II Linux driver (user space, Rust)")]
+struct Cli {
+    /// Isochronous OUT endpoint for playback (hex, e.g. 0x05).
+    #[arg(long, value_parser = parse_hex8, global = true)]
+    play_ep: Option<u8>,
+    /// Isochronous IN feedback endpoint (hex, e.g. 0x81).
+    #[arg(long, value_parser = parse_hex8, global = true)]
+    feedback_ep: Option<u8>,
+    /// Bulk/interrupt IN endpoint for capture (hex, e.g. 0x86).
+    #[arg(long, value_parser = parse_hex8, global = true)]
+    capture_ep: Option<u8>,
+    /// Bulk IN endpoint for raw MIDI (hex, e.g. 0x83).
+    #[arg(long, value_parser = parse_hex8, global = true)]
+    midi_in_ep: Option<u8>,
+    /// Bulk OUT endpoint for raw MIDI (hex, e.g. 0x04).
+    #[arg(long, value_parser = parse_hex8, global = true)]
+    midi_out_ep: Option<u8>,
+    /// Also detach the kernel's class-MIDI driver and claim that interface.
+    #[arg(long, global = true)]
+    take_class_midi: bool,
+    /// Sample rate.
+    #[arg(long, default_value_t = 44_100, global = true)]
+    rate: u32,
+    /// Wire codec for audio.
+    #[arg(long, value_enum, default_value_t = Codec::Plain24, global = true)]
+    codec: Codec,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum Codec {
+    /// Interleaved 24-bit little-endian (what the kext selects for Numark).
+    Plain24,
+    /// Ploytec bit-plane frames (Xone / Reloop layout), in case plain24 is wrong.
+    Junction,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List NS7II devices found in sysfs.
+    List,
+    /// Dump descriptors, kernel drivers and the derived endpoint plan (no claim).
+    Probe,
+    /// Claim the vendor interfaces and run the start-up handshake.
+    Handshake,
+    /// Print raw MIDI received from the device (Ctrl-C to stop).
+    MidiDump,
+    /// Send raw MIDI bytes (hex) to the device, e.g. `90 3c 7f`.
+    MidiSend { bytes: Vec<String> },
+    /// Record capture audio to a WAV file.
+    Record {
+        /// Output file.
+        out: String,
+        /// Seconds to record.
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f32,
+        /// Capture channels (defaults to what the device reports, else 12).
+        #[arg(long)]
+        channels: Option<usize>,
+    },
+    /// Play a WAV file (or a test tone when no file is given).
+    Play {
+        /// Input WAV (16/24/32-bit PCM or float).
+        file: Option<String>,
+        /// Seconds of test tone when no file is given.
+        #[arg(long, default_value_t = 5.0)]
+        seconds: f32,
+        /// Playback channels (defaults to what the device reports, else 4).
+        #[arg(long)]
+        channels: Option<usize>,
+        /// Test tone frequency.
+        #[arg(long, default_value_t = 440.0)]
+        tone_hz: f32,
+    },
+    /// Run as a daemon: ALSA sequencer MIDI ports and PCM bridging.
+    Run {
+        /// ALSA PCM to read playback audio from (what apps play into), e.g. hw:Loopback,1,0.
+        #[arg(long)]
+        pcm_out: Option<String>,
+        /// ALSA PCM to write captured audio to (what apps record from), e.g. hw:Loopback,1,1.
+        #[arg(long)]
+        pcm_in: Option<String>,
+        /// Disable MIDI bridging.
+        #[arg(long)]
+        no_midi: bool,
+        /// ALSA client name.
+        #[arg(long, default_value = "Numark NS7II")]
+        client_name: String,
+    },
+}
+
+fn parse_hex8(s: &str) -> Result<u8, String> {
+    let t = s.trim_start_matches("0x").trim_start_matches("0X");
+    u8::from_str_radix(t, 16).map_err(|e| e.to_string())
+}
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let cli = Cli::parse();
+    if let Err(e) = run(cli) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn overrides(cli: &Cli) -> Overrides {
+    Overrides {
+        playback: cli.play_ep,
+        feedback: cli.feedback_ep,
+        capture: cli.capture_ep,
+        midi_in: cli.midi_in_ep,
+        midi_out: cli.midi_out_ep,
+        take_class_midi: cli.take_class_midi,
+    }
+}
+
+fn ctrl_c_flag() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let f = Arc::clone(&flag);
+    // Minimal SIGINT handling without extra crates: a thread polling stdin is
+    // not an option for a daemon, so install a C handler that sets the flag.
+    static FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+    let _ = FLAG.set(f);
+    extern "C" fn on_sigint(_: i32) {
+        if let Some(f) = FLAG.get() {
+            f.store(true, Ordering::SeqCst);
+        }
+    }
+    // SAFETY: installing an async-signal-safe handler that only stores an atomic.
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as *const () as usize);
+        libc::signal(libc::SIGTERM, on_sigint as *const () as usize);
+    }
+    flag
+}
+
+fn open(cli: &Cli) -> Result<Ns7ii, Box<dyn std::error::Error>> {
+    let dev = Ns7ii::find()?.ok_or("no NS7II (15e4:002c) found; is it powered on and plugged in?")?;
+    let ns = Ns7ii::open(dev, &overrides(cli))?;
+    info!("endpoint plan:\n  {}", ns.plan().describe().replace('\n', "\n  "));
+    Ok(ns)
+}
+
+fn make_codec(codec: Codec, in_ch: usize, out_ch: usize) -> Box<dyn WireCodec + Send> {
+    match codec {
+        Codec::Plain24 => Box::new(Plain24 { out_channels: out_ch, in_channels: in_ch }),
+        Codec::Junction => Box::new(Junction { out_channels: out_ch, in_channels: in_ch }),
+    }
+}
+
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    match &cli.cmd {
+        Cmd::List => {
+            let devs = ns7ii_usb::sysfs::find(Some(ns7ii_proto::VENDOR_ID), Some(ns7ii_proto::PRODUCT_ID))?;
+            if devs.is_empty() {
+                println!("no NS7II found");
+            }
+            for d in devs {
+                println!(
+                    "{}  bus {} addr {}  {} {}  speed {} Mbit/s  bcdDevice {:04x}",
+                    d.devnode(),
+                    d.bus,
+                    d.address,
+                    d.manufacturer.as_deref().unwrap_or("?"),
+                    d.product.as_deref().unwrap_or("?"),
+                    d.speed_mbps.unwrap_or(0),
+                    d.bcd_device.unwrap_or(0)
+                );
+            }
+            Ok(())
+        }
+        Cmd::Probe => {
+            let dev = Ns7ii::find()?.ok_or("no NS7II (15e4:002c) found")?;
+            println!("{}  speed {} Mbit/s", dev.devnode(), dev.speed_mbps.unwrap_or(0));
+            let topo = Ns7ii::topology(&dev)?;
+            print!("{}", topo.dump());
+            println!("kernel drivers:");
+            for (ifnum, drv) in ns7ii_usb::sysfs::interface_drivers(&dev) {
+                println!("  interface {ifnum}: {}", drv.unwrap_or_else(|| "(none)".into()));
+            }
+            let plan = ns7ii_usb::Plan::derive(&topo, &overrides(&cli));
+            println!("derived plan:\n  {}", plan.describe().replace('\n', "\n  "));
+            println!("raw descriptors ({} bytes): {}", dev.descriptors.len(), hex(&dev.descriptors));
+            println!("\nPlease paste this whole output into the project issue tracker.");
+            Ok(())
+        }
+        Cmd::Handshake => {
+            let ns = open(&cli)?;
+            let fw = ns.handshake(cli.rate)?;
+            println!("firmware {}  in {} ch  out {} ch", fw.version_string, fw.in_channels, fw.out_channels);
+            for idx in 0..3u16 {
+                match ns.read_status(idx) {
+                    Ok(v) => println!("status[{idx}] = {v:02x}"),
+                    Err(e) => println!("status[{idx}] read failed: {e}"),
+                }
+            }
+            Ok(())
+        }
+        Cmd::MidiDump => {
+            let ns = open(&cli)?;
+            let _ = ns.handshake(cli.rate);
+            let ep = ns.plan().midi_in.clone().ok_or(
+                "no raw MIDI IN endpoint in the plan. If `probe` shows a class-MIDI interface, the kernel already provides MIDI (try `aseqdump -l`).",
+            )?;
+            let stream = ns.start_bulk_in(&ep, 4, 1)?;
+            let stop = ctrl_c_flag();
+            println!("listening on EP {:02x}; move a control on the NS7II (Ctrl-C to stop)", ep.address);
+            let mut clean = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                match stream.rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(raw) => {
+                        clean.clear();
+                        strip_filler(&raw, &mut clean);
+                        println!("raw {:<24} midi {}", hex(&raw), hex(&clean));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            ns.stop(stream.id);
+            Ok(())
+        }
+        Cmd::MidiSend { bytes } => {
+            let ns = open(&cli)?;
+            let _ = ns.handshake(cli.rate);
+            let msg: Vec<u8> = bytes.iter().map(|b| parse_hex8(b)).collect::<Result<_, _>>()?;
+            let expanded = RunningStatusExpander::new().expand(&msg);
+            let n = ns.midi_write(&expanded)?;
+            println!("sent {n} bytes: {}", hex(&expanded));
+            Ok(())
+        }
+        Cmd::Record { out, seconds, channels } => {
+            let ns = open(&cli)?;
+            let fw = ns.handshake(cli.rate)?;
+            let in_ch = channels.unwrap_or(if fw.in_channels > 0 { fw.in_channels as usize } else { 12 });
+            let ep = ns.plan().capture.clone().ok_or("no capture endpoint in the plan; pass --capture-ep")?;
+            let codec = make_codec(cli.codec, in_ch, 0);
+            let frame_bytes = codec.in_frame_bytes();
+            let packets = if ep.kind == EndpointKind::Interrupt { 8 } else { 16 };
+            let stream = ns.start_bulk_in(&ep, 4, packets)?;
+            let spec = hound::WavSpec { channels: in_ch as u16, sample_rate: cli.rate, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
+            let mut wav = hound::WavWriter::create(out, spec)?;
+            let stop = ctrl_c_flag();
+            let start = Instant::now();
+            let mut pending: Vec<u8> = Vec::new();
+            let mut samples = vec![0i32; 4096 * in_ch];
+            let mut total_bytes = 0usize;
+            let mut frames_written = 0u64;
+            println!("recording {in_ch} channels from EP {:02x} for {seconds} s ...", ep.address);
+            while !stop.load(Ordering::SeqCst) && start.elapsed().as_secs_f32() < *seconds {
+                match stream.rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(raw) => {
+                        total_bytes += raw.len();
+                        pending.extend_from_slice(&raw);
+                        let usable = pending.len() - pending.len() % frame_bytes;
+                        let frames = usable / frame_bytes;
+                        if samples.len() < frames * in_ch {
+                            samples.resize(frames * in_ch, 0);
+                        }
+                        let n = codec.decode(&pending[..usable], &mut samples[..frames * in_ch]);
+                        let n_samples = if matches!(cli.codec, Codec::Junction) { n * in_ch } else { n };
+                        for s in &samples[..n_samples] {
+                            wav.write_sample(*s >> 8)?;
+                        }
+                        frames_written += (n_samples / in_ch) as u64;
+                        pending.drain(..usable);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            ns.stop(stream.id);
+            wav.finalize()?;
+            let secs = start.elapsed().as_secs_f32();
+            println!(
+                "done: {total_bytes} bytes in {secs:.1} s = {:.0} B/s; {frames_written} frames = {:.0} frames/s (expect {})",
+                total_bytes as f32 / secs,
+                frames_written as f32 / secs,
+                cli.rate
+            );
+            Ok(())
+        }
+        Cmd::Play { file, seconds, channels, tone_hz } => {
+            let ns = open(&cli)?;
+            let fw = ns.handshake(cli.rate)?;
+            let out_ch = channels.unwrap_or(if fw.out_channels > 0 { fw.out_channels as usize } else { 4 });
+            let ep = ns.plan().playback.clone().ok_or("no playback endpoint in the plan; pass --play-ep")?;
+            let codec = make_codec(cli.codec, 0, out_ch);
+            let frame_bytes = codec.out_frame_bytes();
+            let source = AudioSource::new();
+            // Pre-encode the whole signal (test tone or file) into the source.
+            let frames: Vec<i32> = match file {
+                Some(path) => read_wav(path, out_ch, cli.rate)?,
+                None => {
+                    let n = (cli.rate as f32 * seconds) as usize;
+                    (0..n)
+                        .flat_map(|i| {
+                            let t = i as f32 / cli.rate as f32;
+                            let v = (t * tone_hz * std::f32::consts::TAU).sin() * 0.3;
+                            std::iter::repeat_n(pcm::from_f32(v), out_ch)
+                        })
+                        .collect()
+                }
+            };
+            let mut wire = vec![0u8; frames.len() / out_ch * frame_bytes];
+            let n = codec.encode(&frames, &mut wire);
+            source.push(&wire[..n]);
+            let total_frames = frames.len() / out_ch;
+            let cfg = IsoOutConfig { rate: cli.rate, frame_bytes, packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
+            let (fb_tx, fb_rx) = mpsc::channel();
+            let fb_id = match &ns.plan().feedback {
+                Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+                None => None,
+            };
+            let stream = ns.start_iso_out(&ep, cfg, source.clone())?;
+            println!("playing {total_frames} frames ({out_ch} ch) to EP {:02x} ...", ep.address);
+            let stop = ctrl_c_flag();
+            let mut last = Instant::now();
+            while !stop.load(Ordering::SeqCst) && source.queued() > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+                while let Ok(fp) = fb_rx.try_recv() {
+                    info!("feedback {}.{:04x} frames/packet", fp >> 16, fp & 0xFFFF);
+                }
+                if last.elapsed() > Duration::from_secs(1) {
+                    let s = *stream.stats.lock().unwrap();
+                    println!(
+                        "urbs {} pkt errors {} underrun {} B  queued {} B",
+                        s.urbs, s.packet_errors, s.underrun_bytes, source.queued()
+                    );
+                    last = Instant::now();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            ns.stop(stream.id);
+            if let Some(id) = fb_id {
+                ns.stop(id);
+            }
+            Ok(())
+        }
+        Cmd::Run { pcm_out, pcm_in, no_midi, client_name } => run_daemon(&cli, pcm_out.clone(), pcm_in.clone(), *no_midi, client_name),
+    }
+}
+
+fn read_wav(path: &str, out_ch: usize, rate: u32) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    if spec.sample_rate != rate {
+        warn!("WAV is {} Hz, device runs at {rate} Hz; no resampling, pitch will be off", spec.sample_rate);
+    }
+    let file_ch = spec.channels as usize;
+    let samples: Vec<i32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.map(pcm::from_f32)).collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let shift = 32 - spec.bits_per_sample as i32;
+            reader.samples::<i32>().map(|s| s.map(|v| v << shift)).collect::<Result<_, _>>()?
+        }
+    };
+    // Map file channels onto device channels: repeat stereo pairs across all outputs.
+    let mut out = Vec::with_capacity(samples.len() / file_ch * out_ch);
+    for frame in samples.chunks_exact(file_ch) {
+        for c in 0..out_ch {
+            out.push(frame[c % file_ch]);
+        }
+    }
+    Ok(out)
+}
+
+fn run_daemon(
+    cli: &Cli,
+    pcm_out: Option<String>,
+    pcm_in: Option<String>,
+    no_midi: bool,
+    client_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ns = Arc::new(open(cli)?);
+    let fw = ns.handshake(cli.rate)?;
+    let stop = ctrl_c_flag();
+    let alsa = ns7ii_alsa::Alsa::load()?;
+    let mut threads = Vec::new();
+
+    // MIDI: device -> sequencer and sequencer -> device.
+    if !no_midi {
+        if let Some(ep) = ns.plan().midi_in.clone() {
+            let mut seq = alsa.open_seq(client_name)?;
+            println!("ALSA MIDI ports: from device {}  to device {}", seq.source_address(), seq.sink_address());
+            let stream = ns.start_bulk_in(&ep, 4, 1)?;
+            let ns2 = Arc::clone(&ns);
+            let stop2 = Arc::clone(&stop);
+            threads.push(std::thread::spawn(move || {
+                let mut clean = Vec::new();
+                let mut outgoing = Vec::new();
+                let mut expander = RunningStatusExpander::new();
+                while !stop2.load(Ordering::SeqCst) {
+                    match stream.rx.recv_timeout(Duration::from_millis(5)) {
+                        Ok(raw) => {
+                            clean.clear();
+                            strip_filler(&raw, &mut clean);
+                            if !clean.is_empty() {
+                                if let Err(e) = seq.send(&clean) {
+                                    warn!("seq send: {e}");
+                                }
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    outgoing.clear();
+                    if let Ok(n) = seq.receive(&mut outgoing) {
+                        if n > 0 && ns2.plan().midi_out.is_some() {
+                            let expanded = expander.expand(&outgoing);
+                            if let Err(e) = ns2.midi_write(&expanded) {
+                                warn!("midi write: {e}");
+                            }
+                        }
+                    }
+                }
+                ns2.stop(stream.id);
+            }));
+        } else if ns.plan().class_midi_interface.is_some() {
+            println!("MIDI: the device has a class-compliant MIDI interface; the kernel's snd-usb-audio provides it (see `aseqdump -l`).");
+        } else {
+            println!("MIDI: no raw MIDI endpoint found; pass --midi-in-ep/--midi-out-ep after checking `probe`.");
+        }
+    }
+
+    // Capture: device -> ALSA PCM (apps record from the other side of a loopback).
+    if let Some(name) = pcm_in {
+        let in_ch = if fw.in_channels > 0 { fw.in_channels as usize } else { 12 };
+        let ep = ns.plan().capture.clone().ok_or("no capture endpoint; pass --capture-ep")?;
+        let mut pcm = alsa.open_pcm(&name, false, in_ch as u32, cli.rate, 50_000)?;
+        let codec = make_codec(cli.codec, in_ch, 0);
+        let frame_bytes = codec.in_frame_bytes();
+        let packets = if ep.kind == EndpointKind::Interrupt { 8 } else { 16 };
+        let stream = ns.start_bulk_in(&ep, 4, packets)?;
+        let ns2 = Arc::clone(&ns);
+        let stop2 = Arc::clone(&stop);
+        let is_junction = matches!(cli.codec, Codec::Junction);
+        threads.push(std::thread::spawn(move || {
+            let mut pending = Vec::new();
+            let mut samples = vec![0i32; 8192 * in_ch];
+            let plain = Plain24 { out_channels: in_ch, in_channels: in_ch };
+            let mut out_bytes = Vec::new();
+            while !stop2.load(Ordering::SeqCst) {
+                match stream.rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(raw) => {
+                        pending.extend_from_slice(&raw);
+                        let usable = pending.len() - pending.len() % frame_bytes;
+                        let frames = usable / frame_bytes;
+                        if samples.len() < frames * in_ch {
+                            samples.resize(frames * in_ch, 0);
+                        }
+                        let n = codec.decode(&pending[..usable], &mut samples[..frames * in_ch]);
+                        let n_samples = if is_junction { n * in_ch } else { n };
+                        out_bytes.resize(n_samples * 3, 0);
+                        plain.encode(&samples[..n_samples], &mut out_bytes);
+                        if let Err(e) = pcm.write(&out_bytes) {
+                            warn!("pcm write: {e}");
+                        }
+                        pending.drain(..usable);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            ns2.stop(stream.id);
+        }));
+    }
+
+    // Playback: ALSA PCM (apps play into the other side of a loopback) -> device.
+    if let Some(name) = pcm_out {
+        let out_ch = if fw.out_channels > 0 { fw.out_channels as usize } else { 4 };
+        let ep = ns.plan().playback.clone().ok_or("no playback endpoint; pass --play-ep")?;
+        let mut pcm = alsa.open_pcm(&name, true, out_ch as u32, cli.rate, 50_000)?;
+        let codec = make_codec(cli.codec, 0, out_ch);
+        let frame_bytes = codec.out_frame_bytes();
+        let source = AudioSource::new();
+        let cfg = IsoOutConfig { rate: cli.rate, frame_bytes, packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
+        let (fb_tx, fb_rx) = mpsc::channel();
+        let fb_id = match &ns.plan().feedback {
+            Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+            None => None,
+        };
+        let stream = ns.start_iso_out(&ep, cfg, source.clone())?;
+        let ns2 = Arc::clone(&ns);
+        let stop2 = Arc::clone(&stop);
+        let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
+        threads.push(std::thread::spawn(move || {
+            let period = 256usize;
+            let mut in_bytes = vec![0u8; period * out_ch * 3];
+            let mut samples = vec![0i32; period * out_ch];
+            let mut wire = vec![0u8; period * frame_bytes];
+            // Keep roughly 20 ms queued ahead of the USB side.
+            let target = (cli_rate(&ns2) as usize / 50) * frame_bytes;
+            while !stop2.load(Ordering::SeqCst) {
+                while let Ok(fp) = fb_rx.try_recv() {
+                    log::debug!("feedback {}.{:04x}", fp >> 16, fp & 0xFFFF);
+                }
+                if source.queued() > target {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                match pcm.read(&mut in_bytes) {
+                    Ok(n) => {
+                        let got = plain.decode(&in_bytes[..n], &mut samples);
+                        let m = codec.encode(&samples[..got], &mut wire);
+                        source.push(&wire[..m]);
+                    }
+                    Err(e) => {
+                        warn!("pcm read: {e}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+            ns2.stop(stream.id);
+            if let Some(id) = fb_id {
+                ns2.stop(id);
+            }
+        }));
+    }
+
+    println!("running; Ctrl-C to stop");
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for t in threads {
+        let _ = t.join();
+    }
+    Ok(())
+}
+
+fn cli_rate(_ns: &Ns7ii) -> u32 {
+    44_100
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 3);
+    for x in b {
+        let _ = write!(s, "{x:02x} ");
+    }
+    s.trim_end().to_string()
+}

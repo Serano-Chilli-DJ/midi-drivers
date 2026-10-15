@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ns7ii-proto",
+    "crates/ns7ii-usb",
+    "crates/ns7ii-alsa",
+    "crates/ns7iid",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unicorn-ai/ns7ii"
+
+[workspace.dependencies]
+ns7ii-proto = { path = "crates/ns7ii-proto" }
+ns7ii-usb = { path = "crates/ns7ii-usb" }
+ns7ii-alsa = { path = "crates/ns7ii-alsa" }
+nusb = "0.2"
+libc = "0.2"
+libloading = "0.8"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+hound = "3"

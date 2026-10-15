@@ -1,0 +1,21 @@
+[package]
+name = "ns7iid"
+description = "Numark NS7II user-space driver daemon and diagnostics CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ns7iid"
+path = "src/main.rs"
+
+[dependencies]
+ns7ii-proto.workspace = true
+ns7ii-usb.workspace = true
+ns7ii-alsa.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+hound.workspace = true
+thiserror.workspace = true
+libc.workspace = true
