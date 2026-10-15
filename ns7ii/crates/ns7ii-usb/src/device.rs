@@ -364,13 +364,19 @@ impl Ns7ii {
             u.set_flags(0);
             list.push(u);
         }
-        let id = self.reactor.add_stream(list, Box::new(BulkInHandler { tx }))?;
-        Ok(BulkInStream { id, rx })
+        let stats = Arc::new(Mutex::new(BulkStats::default()));
+        let id = self.reactor.add_stream(list, Box::new(BulkInHandler { tx, stats: Arc::clone(&stats) }))?;
+        Ok(BulkInStream { id, rx, stats })
     }
 
     /// Stop and remove a stream.
     pub fn stop(&self, id: StreamId) {
         self.reactor.remove_stream(id);
+    }
+
+    /// Clear a halted endpoint.
+    pub fn clear_halt(&self, endpoint: u8) -> Result<()> {
+        Ok(self.dev().clear_halt(endpoint)?)
     }
 
     /// Write one raw MIDI message to the MIDI OUT bulk endpoint (synchronous).
@@ -431,28 +437,57 @@ impl Drop for Ns7ii {
     }
 }
 
+/// Live statistics of a bulk IN stream.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BulkStats {
+    /// URBs completed.
+    pub completions: u64,
+    /// Completions with a non-zero status.
+    pub errors: u64,
+    /// Last non-zero status (negative errno).
+    pub last_error: i32,
+    /// Bytes received.
+    pub bytes: u64,
+}
+
 /// A running bulk IN stream.
 pub struct BulkInStream {
     /// Reactor id (pass to [`Ns7ii::stop`]).
     pub id: StreamId,
     /// Completed transfers (raw bytes).
     pub rx: Receiver<Vec<u8>>,
+    /// Statistics.
+    pub stats: Arc<Mutex<BulkStats>>,
 }
 
 struct BulkInHandler {
     tx: Sender<Vec<u8>>,
+    stats: Arc<Mutex<BulkStats>>,
 }
 
 impl UrbHandler for BulkInHandler {
     fn complete(&mut self, urb: &mut Urb) -> Action {
         let st = urb.status();
+        let n = urb.actual_length();
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.completions += 1;
+            s.bytes += n as u64;
+            if st != 0 {
+                s.errors += 1;
+                s.last_error = st;
+            }
+        }
         if st != 0 && st != -libc::EOVERFLOW {
             if st == -libc::ENODEV || st == -libc::ESHUTDOWN {
                 return Action::Park;
             }
             debug!("bulk IN EP {:02x} status {st}", urb.endpoint());
+            if st == -libc::EPIPE {
+                // Halted endpoint: clear and keep going.
+                let _ = self.tx.send(Vec::new());
+            }
         }
-        let n = urb.actual_length();
         if n > 0 && self.tx.send(urb.buffer()[..n].to_vec()).is_err() {
             return Action::Park;
         }

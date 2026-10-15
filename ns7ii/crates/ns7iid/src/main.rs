@@ -67,8 +67,14 @@ enum Cmd {
     Probe,
     /// Claim the vendor interfaces and run the start-up handshake.
     Handshake,
-    /// Print raw MIDI received from the device (Ctrl-C to stop).
-    MidiDump,
+    /// Print raw MIDI received from the device (Ctrl-C to stop). Also runs the
+    /// audio streams (silence out, capture discarded), because the firmware
+    /// only forwards MIDI while streaming; pass --no-audio to test without.
+    MidiDump {
+        /// Do not start the audio streams.
+        #[arg(long)]
+        no_audio: bool,
+    },
     /// Send raw MIDI bytes (hex) to the device, e.g. `90 3c 7f`.
     MidiSend { bytes: Vec<String> },
     /// Record capture audio to a WAV file.
@@ -224,28 +230,94 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Cmd::MidiDump => {
+        Cmd::MidiDump { no_audio } => {
             let ns = open(&cli)?;
-            let _ = ns.handshake(cli.rate);
+            let fw = ns.handshake(cli.rate)?;
             let ep = ns.plan().midi_in.clone().ok_or(
                 "no raw MIDI IN endpoint in the plan. If `probe` shows a class-MIDI interface, the kernel already provides MIDI (try `aseqdump -l`).",
             )?;
+            // Audio streams first, as the official driver does (AJ::streamingStarted
+            // starts the MIDI reads after the PCM pipes run).
+            let mut audio = None;
+            if !no_audio {
+                let out_ch = if fw.out_channels > 0 { fw.out_channels as usize } else { 4 };
+                let in_ch = if fw.in_channels > 0 { fw.in_channels as usize } else { 12 };
+                let codec = make_codec(cli.codec, in_ch, out_ch);
+                let play_ep = ns.plan().playback.clone().ok_or("no playback endpoint")?;
+                let cap_ep = ns.plan().capture.clone().ok_or("no capture endpoint")?;
+                let (fb_tx, fb_rx) = mpsc::channel();
+                let fb_id = match &ns.plan().feedback {
+                    Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+                    None => None,
+                };
+                let cfg = IsoOutConfig { rate: cli.rate, frame_bytes: codec.out_frame_bytes(), packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
+                let iso = ns.start_iso_out(&play_ep, cfg, AudioSource::new())?;
+                let cap = ns.start_bulk_in(&cap_ep, 4, 16)?;
+                println!("audio streams running: silence -> EP {:02x}, capture from EP {:02x} (discarded)", play_ep.address, cap_ep.address);
+                audio = Some((iso, cap, fb_rx, fb_id));
+            }
             let stream = ns.start_bulk_in(&ep, 4, 1)?;
             let stop = ctrl_c_flag();
             println!("listening on EP {:02x}; move a control on the NS7II (Ctrl-C to stop)", ep.address);
             let mut clean = Vec::new();
+            let mut last = Instant::now();
+            let mut cap_bytes = 0u64;
+            let mut fb_seen = 0u64;
+            let mut fb_last = 0u32;
+            let mut filler_only = 0u64;
             while !stop.load(Ordering::SeqCst) {
-                match stream.rx.recv_timeout(Duration::from_millis(200)) {
+                match stream.rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(raw) if raw.is_empty() => {
+                        warn!("EP {:02x} halted; clearing", ep.address);
+                        let _ = ns.clear_halt(ep.address);
+                    }
                     Ok(raw) => {
                         clean.clear();
                         strip_filler(&raw, &mut clean);
-                        println!("raw {:<24} midi {}", hex(&raw), hex(&clean));
+                        if clean.is_empty() {
+                            filler_only += 1;
+                            if filler_only <= 3 {
+                                println!("raw {:<24} (filler only)", hex(&raw));
+                            }
+                        } else {
+                            println!("raw {:<24} midi {}", hex(&raw), hex(&clean));
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+                if let Some((iso, cap, fb_rx, _)) = &audio {
+                    while let Ok(b) = cap.rx.try_recv() {
+                        cap_bytes += b.len() as u64;
+                    }
+                    while let Ok(fp) = fb_rx.try_recv() {
+                        fb_seen += 1;
+                        fb_last = fp;
+                    }
+                    if last.elapsed() >= Duration::from_secs(2) {
+                        let s = *iso.stats.lock().unwrap();
+                        let cs = *cap.stats.lock().unwrap();
+                        let ms = *stream.stats.lock().unwrap();
+                        println!(
+                            "stats: play urbs {} pkt-err {} | capture {} B ({} B/s) compl {} err {} last {} | midi compl {} err {} last {} filler-only {} | feedback pkts {} last {}.{:04x}",
+                            s.urbs, s.packet_errors,
+                            cap_bytes, cap_bytes / last.elapsed().as_secs().max(1), cs.completions, cs.errors, cs.last_error,
+                            ms.completions, ms.errors, ms.last_error, filler_only,
+                            fb_seen, fb_last >> 16, fb_last & 0xFFFF
+                        );
+                        cap_bytes = 0;
+                        last = Instant::now();
+                    }
+                }
             }
             ns.stop(stream.id);
+            if let Some((iso, cap, _, fb_id)) = audio {
+                ns.stop(iso.id);
+                ns.stop(cap.id);
+                if let Some(id) = fb_id {
+                    ns.stop(id);
+                }
+            }
             Ok(())
         }
         Cmd::MidiSend { bytes } => {
