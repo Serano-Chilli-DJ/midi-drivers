@@ -44,12 +44,22 @@ fn analyze(c: &Capture) -> Option<Binding> {
     }
     match c.kind {
         Kind::Button => {
-            // Press = first note-on with velocity > 0, or first CC with value > 0.
-            let press = msgs.iter().find(|m| matches!(kind(m.status), 0x90 | 0xB0) && m.data[1] > 0)?;
+            // Candidates: note-on or CC with a value > 0. The NS7II sends extra
+            // activity notes next to some buttons (e.g. `90 6C 7F / 90 6C 00`
+            // before BACK's own `90 06 7F / 80 06 00`), so prefer the candidate
+            // that has a real note-off on its channel; otherwise take the first.
+            let has_note_off = |p: &Msg| {
+                msgs.iter().any(|m| kind(m.status) == 0x80 && m.status & 0x0F == p.status & 0x0F && m.data[0] == p.data[0])
+            };
+            let candidates: Vec<&Msg> = msgs.iter().filter(|m| matches!(kind(m.status), 0x90 | 0xB0) && m.data[1] > 0).copied().collect();
+            let press = candidates.iter().find(|p| has_note_off(p)).or_else(|| candidates.first())?;
             let press_id = (press.status, press.data[0]);
             let release = msgs
                 .iter()
-                .find(|m| (kind(m.status) == 0x80 && m.data[0] == press.data[0]) || ((m.status, m.data[0]) == press_id && m.data[1] == 0))
+                .find(|m| {
+                    (kind(m.status) == 0x80 && m.status & 0x0F == press.status & 0x0F && m.data[0] == press.data[0])
+                        || ((m.status, m.data[0]) == press_id && m.data[1] == 0)
+                })
                 .map(|m| (m.status, m.data[0]))
                 .filter(|r| *r != press_id);
             Some(Binding::Button { press: press_id, release })
@@ -428,6 +438,16 @@ mod tests {
         assert!(xml.contains("<status>0xB1</status>"));
         assert!(xml.contains("NS7II.decks[1].rate.input"));
         assert!(js.contains("\"number\": 2"));
+    }
+
+    #[test]
+    fn button_prefers_candidate_with_real_note_off() {
+        // BACK on the NS7II: activity note 90 6C first, then the button itself.
+        let b = analyze(&cap(Kind::Button, &[(0x90, 0x6C, 0x7F), (0x90, 0x6C, 0x00), (0x90, 0x06, 0x7F), (0x80, 0x06, 0x00)])).unwrap();
+        assert_eq!(b, Binding::Button { press: (0x90, 0x06), release: Some((0x80, 0x06)) });
+        // Note-off on another channel does not count.
+        let b = analyze(&cap(Kind::Button, &[(0x90, 0x62, 0x7F), (0x90, 0x62, 0x00), (0x92, 0x31, 0x7F), (0x82, 0x31, 0x00)])).unwrap();
+        assert_eq!(b, Binding::Button { press: (0x92, 0x31), release: Some((0x82, 0x31)) });
     }
 
     #[test]
