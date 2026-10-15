@@ -14,12 +14,9 @@ Environment=RUST_LOG=info
 # The daemon exits on unplug; udev starts a fresh instance on the next plug-in.
 Restart=on-failure
 RestartSec=3
-# Hardening: it only needs /dev/bus/usb and /dev/snd.
+# Hardening. No device allow-list: it needs /dev/bus/usb and /dev/snd, and
+# systemd's DevicePolicy/DeviceAllow denied /dev/snd/seq on a test machine.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-DeviceAllow=char-usb_device rw
-# ALSA: the sequencer (/dev/snd/seq) and PCM/control nodes share the "snd" char major.
-DeviceAllow=char-snd rw
-DevicePolicy=closed
