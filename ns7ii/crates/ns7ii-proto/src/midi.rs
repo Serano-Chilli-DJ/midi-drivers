@@ -112,6 +112,106 @@ impl RunningStatusExpander {
     }
 }
 
+/// A parsed MIDI message (channel-voice, system common or real-time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// Status byte including channel (e.g. `0x90`).
+    pub status: u8,
+    /// Data bytes (0 to 2 for short messages; whole body for SysEx).
+    pub data: Vec<u8>,
+}
+
+impl Message {
+    /// MIDI channel (0-based) for channel-voice messages.
+    pub fn channel(&self) -> u8 {
+        self.status & 0x0F
+    }
+    /// Message kind (status with channel masked off).
+    pub fn kind(&self) -> u8 {
+        if self.status >= 0xF0 { self.status } else { self.status & 0xF0 }
+    }
+    /// First data byte (note or controller number), if any.
+    pub fn d1(&self) -> Option<u8> {
+        self.data.first().copied()
+    }
+    /// Second data byte (velocity or value), if any.
+    pub fn d2(&self) -> Option<u8> {
+        self.data.get(1).copied()
+    }
+}
+
+/// Incremental MIDI byte-stream parser with running status.
+#[derive(Debug, Default, Clone)]
+pub struct Parser {
+    status: Option<u8>,
+    buf: Vec<u8>,
+    need: usize,
+    in_sysex: bool,
+}
+
+impl Parser {
+    /// Fresh parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one byte; returns a message when one completes.
+    pub fn push(&mut self, byte: u8) -> Option<Message> {
+        if byte >= 0xF8 {
+            return Some(Message { status: byte, data: Vec::new() });
+        }
+        if self.in_sysex {
+            if byte == 0xF7 {
+                self.in_sysex = false;
+                let data = std::mem::take(&mut self.buf);
+                return Some(Message { status: 0xF0, data });
+            }
+            if byte & 0x80 == 0 {
+                self.buf.push(byte);
+            } else {
+                // Interrupted SysEx: drop it and process the new status.
+                self.in_sysex = false;
+                self.buf.clear();
+                return self.push(byte);
+            }
+            return None;
+        }
+        if byte == 0xF0 {
+            self.in_sysex = true;
+            self.buf.clear();
+            return None;
+        }
+        if byte & 0x80 != 0 {
+            self.buf.clear();
+            let need = match byte {
+                0x80..=0xEF => data_bytes_for(byte) as usize,
+                0xF1 | 0xF3 => 1,
+                0xF2 => 2,
+                _ => 0,
+            };
+            if need == 0 {
+                self.status = None;
+                return Some(Message { status: byte, data: Vec::new() });
+            }
+            self.status = Some(byte);
+            self.need = need;
+            return None;
+        }
+        let status = self.status?;
+        self.buf.push(byte);
+        if self.buf.len() >= self.need {
+            let data = std::mem::take(&mut self.buf);
+            return Some(Message { status, data });
+        }
+        None
+    }
+
+    /// Parse a whole buffer.
+    pub fn parse(&mut self, bytes: &[u8]) -> Vec<Message> {
+        bytes.iter().filter_map(|b| self.push(*b)).collect()
+    }
+}
+
 /// Number of data bytes that follow a channel-voice status byte.
 pub fn data_bytes_for(status: u8) -> u8 {
     match status & 0xF0 {
@@ -266,6 +366,18 @@ mod tests {
         let mut x = RunningStatusExpander::new();
         let msg = [0xF0, 0x00, 0x01, 0x3F, 0x12, 0xF7, 0x90, 0x01, 0x02];
         assert_eq!(x.expand(&msg), msg.to_vec());
+    }
+
+    #[test]
+    fn parser_handles_running_status_and_realtime() {
+        let mut p = Parser::new();
+        let msgs = p.parse(&[0x90, 0x3C, 0x7F, 0xF8, 0x3E, 0x00, 0xB1, 0x07, 0x40]);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0], Message { status: 0x90, data: vec![0x3C, 0x7F] });
+        assert_eq!(msgs[1].status, 0xF8);
+        assert_eq!(msgs[2], Message { status: 0x90, data: vec![0x3E, 0x00] });
+        assert_eq!(msgs[3].channel(), 1);
+        assert_eq!(msgs[3].kind(), 0xB0);
     }
 
     #[test]

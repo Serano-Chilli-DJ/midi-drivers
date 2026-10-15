@@ -9,6 +9,9 @@
 //! 4. `record`: capture audio to a WAV file; `play`: play a WAV or test tone.
 //! 5. `run`: the daemon — ALSA sequencer MIDI ports plus PCM bridging.
 
+mod learn;
+mod mixxx;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use log::{info, warn};
 use ns7ii_proto::midi::{strip_filler, RunningStatusExpander};
@@ -77,6 +80,21 @@ enum Cmd {
     },
     /// Send raw MIDI bytes (hex) to the device, e.g. `90 3c 7f`.
     MidiSend { bytes: Vec<String> },
+    /// Guided capture of every control for building a Mixxx mapping.
+    MidiLearn {
+        /// Capture file (resumed if it exists).
+        #[arg(long, default_value = "ns7ii-learn.json")]
+        out: String,
+    },
+    /// Generate a Mixxx mapping (XML + JS) from a capture file.
+    MixxxMap {
+        /// Capture file from `midi-learn`.
+        #[arg(default_value = "ns7ii-learn.json")]
+        input: String,
+        /// Directory to write `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js` into.
+        #[arg(long, default_value = ".")]
+        out_dir: String,
+    },
     /// Record capture audio to a WAV file.
     Record {
         /// Output file.
@@ -318,6 +336,39 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     ns.stop(id);
                 }
             }
+            Ok(())
+        }
+        Cmd::MidiLearn { out } => {
+            let ns = open(&cli)?;
+            let fw = ns.handshake(cli.rate)?;
+            let ep = ns.plan().midi_in.clone().ok_or("no raw MIDI IN endpoint in the plan")?;
+            let audio = AudioBackground::start(&ns, &fw, cli.codec, cli.rate)?;
+            let stream = ns.start_bulk_in(&ep, 4, 1)?;
+            let mut learned = if std::path::Path::new(out).exists() {
+                println!("resuming {out}");
+                learn::Learned::load(out)?
+            } else {
+                learn::Learned::default()
+            };
+            learned.device = format!("{} {}", ns.info().manufacturer.as_deref().unwrap_or("Numark"), ns.info().product.as_deref().unwrap_or("NS7II"));
+            learned.firmware = fw.version_string.clone();
+            let result = learn::run(&stream.rx, out, learned);
+            ns.stop(stream.id);
+            audio.stop(&ns);
+            result?;
+            println!("next: ns7iid mixxx-map {out} --out-dir ~/.mixxx/controllers");
+            Ok(())
+        }
+        Cmd::MixxxMap { input, out_dir } => {
+            let learned = learn::Learned::load(input)?;
+            let (xml, js) = mixxx::generate(&learned)?;
+            std::fs::create_dir_all(out_dir)?;
+            let xml_path = format!("{out_dir}/Numark NS7II.midi.xml");
+            let js_path = format!("{out_dir}/Numark-NS7II-scripts.js");
+            std::fs::write(&xml_path, xml)?;
+            std::fs::write(&js_path, js)?;
+            println!("wrote {xml_path}\nwrote {js_path}");
+            println!("Restart Mixxx, open Preferences > Controllers > Numark NS7II and select the \"Numark NS7II\" mapping.");
             Ok(())
         }
         Cmd::MidiSend { bytes } => {
@@ -655,4 +706,54 @@ fn hex(b: &[u8]) -> String {
         let _ = write!(s, "{x:02x} ");
     }
     s.trim_end().to_string()
+}
+
+/// The audio streams the firmware needs before it forwards MIDI: silence to
+/// the playback endpoint, capture drained and discarded, feedback drained.
+struct AudioBackground {
+    iso: ns7ii_usb::device::IsoOutStream,
+    cap_id: ns7ii_usb::reactor::StreamId,
+    fb_id: Option<ns7ii_usb::reactor::StreamId>,
+    drain: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl AudioBackground {
+    fn start(ns: &Ns7ii, fw: &ns7ii_proto::requests::FirmwareInfo, codec: Codec, rate: u32) -> Result<Self, Box<dyn std::error::Error>> {
+        let out_ch = if fw.out_channels > 0 { fw.out_channels as usize } else { 4 };
+        let in_ch = if fw.in_channels > 0 { fw.in_channels as usize } else { 12 };
+        let codec = make_codec(codec, in_ch, out_ch);
+        let play_ep = ns.plan().playback.clone().ok_or("no playback endpoint")?;
+        let cap_ep = ns.plan().capture.clone().ok_or("no capture endpoint")?;
+        let (fb_tx, fb_rx) = mpsc::channel();
+        let fb_id = match &ns.plan().feedback {
+            Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+            None => None,
+        };
+        let cfg = IsoOutConfig { rate, frame_bytes: codec.out_frame_bytes(), packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
+        let iso = ns.start_iso_out(&play_ep, cfg, AudioSource::new())?;
+        let cap = ns.start_bulk_in(&cap_ep, 4, 16)?;
+        let cap_id = cap.id;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let drain = std::thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                let _ = cap.rx.recv_timeout(Duration::from_millis(50));
+                while fb_rx.try_recv().is_ok() {}
+            }
+        });
+        Ok(Self { iso, cap_id, fb_id, drain: Some(drain), stop })
+    }
+
+    fn stop(mut self, ns: &Ns7ii) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(d) = self.drain.take() {
+            let _ = d.join();
+        }
+        ns.stop(self.iso.id);
+        ns.stop(self.cap_id);
+        if let Some(id) = self.fb_id {
+            ns.stop(id);
+        }
+    }
 }

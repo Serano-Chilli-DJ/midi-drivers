@@ -102,6 +102,20 @@ Point Mixxx at `hw:Loopback,0,0` (output) and `hw:Loopback,0,1` (input) and
 at the "Numark NS7II" MIDI ports. PipeWire users can instead use
 `pw-loopback` or just leave PipeWire on the loopback card.
 
+## Step 7: Mixxx mapping
+
+```
+systemctl stop ns7iid
+ns7iid midi-learn                 # follow the prompts; Enter skips, r redoes, q saves and quits
+ns7iid mixxx-map --out-dir ~/.mixxx/controllers
+systemctl start ns7iid
+```
+
+Then restart Mixxx and select "Numark NS7II" for the controller. If a control
+behaves wrongly, delete its entry from `ns7ii-learn.json`, run `midi-learn`
+again (it resumes), and regenerate. Settings such as pitch fader direction
+and platter resolution are at the top of `Numark-NS7II-scripts.js`.
+
 ## What to send back
 
 `lsusb.txt`, the full output of `probe` and `handshake`, any pcap, and for

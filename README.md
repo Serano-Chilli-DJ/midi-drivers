@@ -56,6 +56,26 @@ Then, with the NS7II plugged in:
 ./target/release/ns7iid run --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,1
 ```
 
+## Mixxx mapping
+
+Mixxx has no NS7II mapping and Numark never published the MIDI chart, so
+the driver builds one from the unit itself:
+
+```
+systemctl stop ns7iid                      # the service holds the device
+ns7iid midi-learn                          # ~5 minutes: touch each control when asked
+ns7iid mixxx-map --out-dir ~/.mixxx/controllers
+systemctl start ns7iid
+```
+
+`midi-learn` captures deck 1 completely and a few controls on decks 2 to 4
+and the other mixer channels to learn the numbering scheme; `mixxx-map`
+extrapolates the rest and writes `Numark NS7II.midi.xml` plus
+`Numark-NS7II-scripts.js` (platter scratching, strip search, pads in hot
+cue / loop / beat-jump / sampler modes, loops, FX, mixer, library, LEDs).
+Restart Mixxx and pick the "Numark NS7II" mapping in Preferences, Controllers.
+The capture is saved to `ns7ii-learn.json` and can be resumed or edited.
+
 ## One correction to the premise
 
 USB itself has no 32-bit or 64-bit flavour. What broke the NS7II on modern
