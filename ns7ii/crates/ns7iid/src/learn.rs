@@ -113,6 +113,20 @@ pub fn script() -> Vec<Section> {
             b("load", "LOAD button for this deck"),
         ],
     };
+    let mixer_full = |key: &'static str, title: &'static str, intro: &'static str| Section {
+        key,
+        title,
+        intro,
+        prompts: vec![
+            p("gain", "GAIN knob: turn fully"),
+            p("treble", "TREBLE / HIGH knob: turn fully"),
+            p("mid", "MID knob: turn fully"),
+            p("bass", "BASS / LOW knob: turn fully"),
+            p("filter", "FILTER knob: turn fully"),
+            b("pfl", "CUE (headphone) button"),
+            p("fader", "channel line fader: move it from bottom to top"),
+        ],
+    };
     vec![
         deck_full("deck1", "Deck 1 (left side, deck 1 selected)"),
         Section {
@@ -141,38 +155,10 @@ pub fn script() -> Vec<Section> {
             intro: "Press the right DECK button so the right side controls deck 4, then:",
             prompts: vec![b("play", "PLAY/PAUSE (right side, deck 4)"), b("pad1", "PAD 1 (right side, deck 4)")],
         },
-        Section {
-            key: "mixer1",
-            title: "Mixer channel 1",
-            intro: "Mixer channel 1 is the leftmost channel strip.",
-            prompts: vec![
-                p("gain", "GAIN knob: turn fully"),
-                p("treble", "TREBLE / HIGH knob: turn fully"),
-                p("mid", "MID knob: turn fully"),
-                p("bass", "BASS / LOW knob: turn fully"),
-                p("filter", "FILTER knob: turn fully"),
-                b("pfl", "CUE (headphone) button"),
-                p("fader", "channel line fader: move it from bottom to top"),
-            ],
-        },
-        Section {
-            key: "mixer2",
-            title: "Mixer channel 2",
-            intro: "",
-            prompts: vec![p("fader", "channel 2 line fader"), b("pfl", "channel 2 CUE button"), p("filter", "channel 2 FILTER knob")],
-        },
-        Section {
-            key: "mixer3",
-            title: "Mixer channel 3",
-            intro: "",
-            prompts: vec![p("fader", "channel 3 line fader"), b("pfl", "channel 3 CUE button"), p("filter", "channel 3 FILTER knob")],
-        },
-        Section {
-            key: "mixer4",
-            title: "Mixer channel 4",
-            intro: "",
-            prompts: vec![p("fader", "channel 4 line fader"), b("pfl", "channel 4 CUE button"), p("filter", "channel 4 FILTER knob")],
-        },
+        mixer_full("mixer1", "Mixer channel 1", "Mixer channel 1 is the leftmost channel strip. The NS7II numbers the strips irregularly, so every channel is captured in full."),
+        mixer_full("mixer2", "Mixer channel 2", ""),
+        mixer_full("mixer3", "Mixer channel 3", ""),
+        mixer_full("mixer4", "Mixer channel 4", ""),
         Section {
             key: "master",
             title: "Master section and library",
@@ -333,6 +319,8 @@ pub fn run(rx: &Receiver<Vec<u8>>, out_path: &str, mut learned: Learned) -> Resu
                     return Ok(learned);
                 }
                 if cmd == "s" {
+                    let left = section.prompts.iter().filter(|p| learned.get(section.key, p.id).is_none()).count();
+                    println!("    skipped the rest of \"{}\" ({left} controls); run midi-learn again later to capture them", section.title);
                     skip_section = true;
                     break;
                 }
@@ -345,6 +333,11 @@ pub fn run(rx: &Receiver<Vec<u8>>, out_path: &str, mut learned: Learned) -> Resu
                 }
                 let summary = summarize(prompt.kind, &collected);
                 println!("    -> {summary}");
+                if let Some(twin) = same_as_other_deck(&learned, section.key, prompt.id, &collected) {
+                    println!("    this is exactly what {twin} sends: the DECK button did not switch layers.");
+                    println!("    Press DECK (its LED changes), then touch the control again. Enter without touching anything skips.");
+                    continue;
+                }
                 learned
                     .sections
                     .entry(section.key.to_string())
@@ -359,6 +352,21 @@ pub fn run(rx: &Receiver<Vec<u8>>, out_path: &str, mut learned: Learned) -> Resu
     println!();
     println!("capture complete: {out_path}");
     Ok(learned)
+}
+
+/// For deck 3 / deck 4 captures: the deck 1 / deck 2 section that already
+/// holds the identical message, if any. Identical means the DECK layer
+/// button had no effect, and mapping both would drive two Mixxx decks at once.
+fn same_as_other_deck(learned: &Learned, section: &str, id: &str, collected: &[Message]) -> Option<&'static str> {
+    let twin = match section {
+        "deck3" => "deck1",
+        "deck4" => "deck2",
+        _ => return None,
+    };
+    let other = learned.get(twin, id)?;
+    let first = |ms: &[Msg]| ms.iter().find(|m| m.data.len() >= 2 && m.status >= 0x80 && m.status < 0xF0).map(|m| (m.status, m.data[0]));
+    let mine: Vec<Msg> = collected.iter().map(Msg::from).collect();
+    (first(&mine).is_some() && first(&mine) == first(&other.messages)).then_some(twin)
 }
 
 fn fmt_msg(m: &Message) -> String {
