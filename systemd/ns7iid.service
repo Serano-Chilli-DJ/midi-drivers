@@ -2,6 +2,8 @@
 Description=Numark NS7II user-space driver (MIDI + audio bridge)
 # Started by the udev rule in udev/99-numark-ns7ii.rules when the device appears.
 After=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,12 +13,13 @@ ExecStart=/usr/local/bin/ns7iid run
 Environment=RUST_LOG=info
 # The daemon exits on unplug; udev starts a fresh instance on the next plug-in.
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 # Hardening: it only needs /dev/bus/usb and /dev/snd.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
 DeviceAllow=char-usb_device rw
-DeviceAllow=/dev/snd rw
+# ALSA: the sequencer (/dev/snd/seq) and PCM/control nodes share the "snd" char major.
+DeviceAllow=char-snd rw
 DevicePolicy=closed
