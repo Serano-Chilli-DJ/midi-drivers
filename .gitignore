@@ -1,3 +1,4 @@
 ns7ii/target/
 tmp/
 *.wav
+dist/
