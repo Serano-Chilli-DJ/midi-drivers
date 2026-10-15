@@ -636,6 +636,11 @@ fn run_daemon(
 
     println!("running; Ctrl-C to stop");
     while !stop.load(Ordering::SeqCst) {
+        if !ns.is_connected() {
+            info!("NS7II unplugged; exiting");
+            stop.store(true, Ordering::SeqCst);
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     for t in threads {

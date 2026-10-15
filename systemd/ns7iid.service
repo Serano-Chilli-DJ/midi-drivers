@@ -1,0 +1,22 @@
+[Unit]
+Description=Numark NS7II user-space driver (MIDI + audio bridge)
+# Started by the udev rule in udev/99-numark-ns7ii.rules when the device appears.
+After=sound.target
+
+[Service]
+Type=simple
+# Add --pcm-out/--pcm-in here once audio bridging is verified, e.g.
+#   --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,1
+ExecStart=/usr/local/bin/ns7iid run
+Environment=RUST_LOG=info
+# The daemon exits on unplug; udev starts a fresh instance on the next plug-in.
+Restart=on-failure
+RestartSec=2
+# Hardening: it only needs /dev/bus/usb and /dev/snd.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+DeviceAllow=char-usb_device rw
+DeviceAllow=/dev/snd rw
+DevicePolicy=closed

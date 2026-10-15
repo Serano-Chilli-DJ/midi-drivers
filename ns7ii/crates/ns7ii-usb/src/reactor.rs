@@ -10,7 +10,7 @@ use log::{debug, warn};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -58,6 +58,7 @@ pub struct Reactor {
     tx: Sender<Command>,
     thread: Option<JoinHandle<()>>,
     next_id: AtomicUsize,
+    disconnected: Arc<AtomicBool>,
 }
 
 static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
@@ -72,11 +73,18 @@ impl Reactor {
     pub fn start(dev: Arc<UsbfsDevice>) -> Self {
         let (tx, rx) = mpsc::channel();
         let d = Arc::clone(&dev);
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&disconnected);
         let thread = thread::Builder::new()
             .name("ns7ii-usb-reactor".into())
-            .spawn(move || run(d, rx))
+            .spawn(move || run(d, rx, flag))
             .expect("spawn reactor thread");
-        Self { dev, tx, thread: Some(thread), next_id: AtomicUsize::new(1) }
+        Self { dev, tx, thread: Some(thread), next_id: AtomicUsize::new(1), disconnected }
+    }
+
+    /// True once the device has gone away (reap returned ENODEV).
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
     }
 
     /// The device this reactor serves.
@@ -123,7 +131,7 @@ fn dev_fd(dev: &UsbfsDevice) -> i32 {
     dev.as_raw_fd()
 }
 
-fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>) {
+fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>, disconnected: Arc<AtomicBool>) {
     let mut streams: HashMap<StreamId, StreamState> = HashMap::new();
     let mut token_owner: HashMap<usize, StreamId> = HashMap::new();
     let mut shutdown = false;
@@ -226,6 +234,9 @@ fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>) {
                     Err(e) => {
                         // ENODEV: device unplugged. Park everything.
                         warn!("reap failed: {e}");
+                        if e.raw_os_error() == Some(libc::ENODEV) {
+                            disconnected.store(true, Ordering::SeqCst);
+                        }
                         for st in streams.values_mut() {
                             st.stopping = true;
                             for urb in st.urbs.values_mut() {

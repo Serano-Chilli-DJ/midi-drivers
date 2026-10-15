@@ -229,6 +229,10 @@ impl Ns7ii {
     pub fn speed(&self) -> Speed {
         self.speed
     }
+    /// False once the device has been unplugged.
+    pub fn is_connected(&self) -> bool {
+        !self.reactor.is_disconnected()
+    }
     /// Is this a high-speed (or faster) link?
     pub fn high_speed(&self) -> bool {
         matches!(self.speed, Speed::High | Speed::Super)
