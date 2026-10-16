@@ -29,6 +29,9 @@ pub enum Error {
     /// The topology lacks an endpoint we need.
     #[error("no suitable {0} endpoint found; pass it explicitly with --{1}")]
     MissingEndpoint(&'static str, &'static str),
+    /// Another process already holds the interface through usbfs.
+    #[error("interface {0} is in use by another process, normally the ns7iid service; stop it first (sudo systemctl stop ns7iid) and start it again afterwards (sudo systemctl start ns7iid)")]
+    Busy(u8),
 }
 
 /// Result alias.
@@ -199,6 +202,11 @@ impl Ns7ii {
         let mut claimed = Vec::new();
         for (ifnum, alt) in &plan.claims {
             if let Ok(Some(drv)) = dev.kernel_driver(*ifnum) {
+                if drv == "usbfs" {
+                    // Not a kernel driver: another user-space process (normally the
+                    // ns7iid service) has this interface claimed through usbfs.
+                    return Err(Error::Busy(*ifnum));
+                }
                 info!("interface {ifnum}: detaching kernel driver {drv}");
             }
             dev.detach_and_claim(*ifnum)?;
