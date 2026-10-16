@@ -86,8 +86,12 @@ Enabled and Apply.
 The mapping covers all four decks (DECK buttons switch layers), platters,
 strip search, the hot cue row, pads in hot cue / auto loop / manual loop /
 slicer / sampler modes, beat grid buttons, FX, mixer with FX and crossfader
-assign, library, microphone, front panel switches and LEDs. Settings such
-as pitch fader direction and platter resolution are at the top of
+assign, library, microphone, front panel switches and LEDs. The platter
+motors start and stop with the deck and follow the pitch fader (the motor
+commands were decoded from the firmware; the pitch scale is a setting until
+confirmed on hardware). SHIFT + SLIP MODE turns a deck's motor off, which
+makes its platter a plain jog wheel. Settings such as pitch fader direction,
+platter resolution and motor behaviour are at the top of
 `Numark-NS7II-scripts.js`.
 
 If a control on your unit does not match the chart, `midi-learn` still

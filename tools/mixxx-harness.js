@@ -50,6 +50,17 @@ ctx.NS7II.setShift(0, true); press('pad1'); ctx.NS7II.setShift(0, false);
 if (d.platterTouch) { d.platterTouch.input(0, 0, 0x7F, 0x90, '[Channel1]'); }
 if (d.platterTurn) { for (let i = 0; i < 10; i++) d.platterTurn.input(0, 6, 66); }
 if (d.platterTouch) { d.platterTouch.input(0, 0, 0, 0x90, '[Channel1]'); }
+// Motor: starting deck 1 must send start + pitch on the deck's channel, stopping must send stop.
+values['[Channel1]rate'] = 0;   // earlier sweeps moved the pitch; 0% must encode as 0x2000
+const before = log.length;
+d.motorStart();
+d.sendMotorPitch();
+d.motorStop();
+const motorMsgs = log.slice(before).filter(l => l[0] === 'midi').map(l => l.slice(1));
+const want = [[0xB1, 0x43, 0], [0xB1, 0x44, 0], [0xB1, 0x69, 0x40], [0xB1, 0x49, 0x00]];
+for (const w of want) {
+  if (!motorMsgs.some(m => m[0] === w[0] && m[1] === w[1] && m[2] === w[2])) { console.log('FAIL motor message missing', w.map(x => x.toString(16))); failures++; }
+}
 vm.runInContext('NS7II.shutdown();', ctx);
 const ticks = log.filter(l => l[0] === 'tick').length;
 const sets = log.filter(l => l[0] === 'set' || l[0] === 'setp').length;

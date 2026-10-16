@@ -18,6 +18,10 @@ NS7II.settings = {
     scratchAlpha: 1.0 / 8,
     scratchBeta: 1.0 / 8 / 32,
     jogSensitivity: 40,         // jog (non-vinyl) ticks per "jog" unit
+    motor: true,                // spin the platters while a deck plays (SHIFT + SLIP MODE toggles a deck's motor)
+    rpm: 33 + 1 / 3,            // 33.333 or 45
+    motorPitchFullScale: 1.0,   // platter speed change at full deflection of the 14-bit motor pitch value (unverified: 1.0 = +100%)
+    scratchRelease: 150,        // ms without platter ticks before scratch mode ends when the motor is off
     loopSizes: [0.125, 0.25, 0.5, 1, 2, 4, 8, 16],
     jumpSizes: [1, 2, 4, 8],
     browseAccel: 5,             // rows per click with SHIFT
@@ -112,7 +116,6 @@ NS7II.Deck = function(desc) {
     if (has("cue")) { add("cue", new components.CueButton({midi: midiOf("cue")})); }
     if (has("sync")) { add("sync", new components.SyncButton({midi: midiOf("sync")})); }
     simpleButton("keylock", "keylock", true);
-    simpleButton("slip", "slip_enabled", true);
     simpleButton("censor", "reverseroll", false);
     simpleButton("reverse", "reverse", true);
     simpleButton("pitch_bend_minus", "rate_temp_down", false);
@@ -157,19 +160,92 @@ NS7II.Deck = function(desc) {
         }));
     }
 
-    // Platter: touch = scratch enable, turn = ticks.
+    // Platter motor. The NS7II platters are motorised turntables without a
+    // touch sensor: while the motor runs, scratch mode stays on and the
+    // engine follows the platter (hold the vinyl and playback stops).
+    // Commands go to the deck's own MIDI channel as controller changes:
+    // 0x43 start, 0x44 stop, 0x45 rpm, 0x46 reverse, 0x47/0x48 start/stop
+    // time, 0x69 (MSB) + 0x49 (LSB) pitch as 0x2000 + signed offset.
+    var ccStatus = has("play") ? (0xB0 | (midiOf("play")[0] & 0x0F)) : null;
+    this.motorEnabled = NS7II.settings.motor;
+    this.motorRunning = false;
+    this.scratchTimer = 0;
+    this.motorSend = function(cc, v) {
+        if (ccStatus !== null) { midi.sendShortMsg(ccStatus, cc, v & 0x7F); }
+    };
+    this.sendMotorPitch = function() {
+        var rate = engine.getValue(deck.group, "rate") * engine.getValue(deck.group, "rateRange");
+        var v = Math.round(0x2000 + rate / NS7II.settings.motorPitchFullScale * 0x1FFF);
+        v = Math.max(0, Math.min(0x3FFF, v));
+        deck.motorSend(0x69, v >> 7);
+        deck.motorSend(0x49, v & 0x7F);
+    };
+    this.motorStart = function() {
+        if (!deck.motorEnabled || ccStatus === null) { return; }
+        deck.motorSend(0x45, NS7II.settings.rpm > 40 ? 1 : 0);
+        deck.motorSend(0x46, engine.getValue(deck.group, "reverse") > 0 ? 1 : 0);
+        deck.sendMotorPitch();
+        deck.motorSend(0x43, 0);
+        deck.motorRunning = true;
+        deck.scratchOn();
+    };
+    this.motorStop = function() {
+        if (ccStatus === null) { return; }
+        deck.motorSend(0x44, 0);
+        deck.motorRunning = false;
+        deck.scratchOff();
+    };
+    this.scratchOn = function() {
+        if (!engine.isScratching(n)) {
+            engine.scratchEnable(n, NS7II.settings.platterTicks, NS7II.settings.rpm,
+                NS7II.settings.scratchAlpha, NS7II.settings.scratchBeta, false);
+        }
+    };
+    this.scratchOff = function() {
+        if (deck.scratchTimer) { engine.stopTimer(deck.scratchTimer); deck.scratchTimer = 0; }
+        if (engine.isScratching(n)) { engine.scratchDisable(n, false); }
+    };
+    this.toggleMotor = function() {
+        deck.motorEnabled = !deck.motorEnabled;
+        if (deck.motorEnabled && engine.getValue(deck.group, "play") > 0) { deck.motorStart(); } else { deck.motorStop(); }
+        if (deck.slip) { deck.slip.trigger(); }
+    };
+    this.motorConnections = [
+        engine.makeConnection(this.group, "play", function(v) { if (v > 0) { deck.motorStart(); } else { deck.motorStop(); } }),
+        engine.makeConnection(this.group, "rate", function() { if (deck.motorRunning) { deck.sendMotorPitch(); } }),
+        engine.makeConnection(this.group, "rateRange", function() { if (deck.motorRunning) { deck.sendMotorPitch(); } }),
+        engine.makeConnection(this.group, "reverse", function(v) { deck.motorSend(0x46, v > 0 ? 1 : 0); }),
+    ];
+    // START TIME / STOP TIME knobs are forwarded to the motor controller.
+    if (has("start_time")) {
+        add("start_time", new components.Component({midi: midiOf("start_time"), input: function(channel, control, value) { deck.motorSend(0x47, value); }}));
+    }
+    if (has("stop_time")) {
+        add("stop_time", new components.Component({midi: midiOf("stop_time"), input: function(channel, control, value) { deck.motorSend(0x48, value); }}));
+    }
+    // SLIP MODE / MOTOR OFF: plain press toggles slip, SHIFT + press toggles this deck's motor.
+    if (has("slip")) {
+        add("slip", new components.Button({
+            midi: midiOf("slip"), group: this.group, key: "slip_enabled",
+            type: components.Button.prototype.types.toggle,
+            input: function(channel, control, value, status, group) {
+                if (NS7II.shiftState[deck.side]) {
+                    if (this.isPress(channel, control, value, status)) { deck.toggleMotor(); }
+                    return;
+                }
+                components.Button.prototype.input.call(this, channel, control, value, status, group);
+            },
+        }));
+    }
+
+    // Platter turn = ticks. With the motor running the engine is already in
+    // scratch mode; with it off, the first tick enters scratch mode and
+    // silence for `scratchRelease` ms leaves it (there is no touch sensor).
     if (has("platter_touch")) {
         add("platter_touch", new components.Button({
             midi: midiOf("platter_touch"),
             input: function(channel, control, value, status) {
-                if (this.isPress(channel, control, value, status)) {
-                    if (deck.vinylMode) {
-                        engine.scratchEnable(n, NS7II.settings.platterTicks, 33 + 1 / 3,
-                            NS7II.settings.scratchAlpha, NS7II.settings.scratchBeta);
-                    }
-                } else {
-                    engine.scratchDisable(n);
-                }
+                if (this.isPress(channel, control, value, status)) { deck.scratchOn(); } else { deck.scratchOff(); }
             },
         }));
     }
@@ -192,10 +268,22 @@ NS7II.Deck = function(desc) {
             },
             apply: function(d) {
                 if (d === 0) { return; }
-                if (engine.isScratching(n)) {
+                if (deck.motorRunning) {
                     engine.scratchTick(n, d);
-                } else if (NS7II.shiftState[deck.side]) {
+                    return;
+                }
+                if (NS7II.shiftState[deck.side]) {
                     engine.setValue(deck.group, "beatjump", d > 0 ? 1 : -1);
+                    return;
+                }
+                if (deck.vinylMode) {
+                    deck.scratchOn();
+                    engine.scratchTick(n, d);
+                    if (deck.scratchTimer) { engine.stopTimer(deck.scratchTimer); }
+                    deck.scratchTimer = engine.beginTimer(NS7II.settings.scratchRelease, function() {
+                        deck.scratchTimer = 0;
+                        if (engine.isScratching(n)) { engine.scratchDisable(n, true); }
+                    }, true);
                 } else {
                     engine.setValue(deck.group, "jog", d / NS7II.settings.jogSensitivity);
                 }
@@ -247,8 +335,8 @@ NS7II.Deck = function(desc) {
             midi: midiOf("motor"),
             input: function(channel, control, value, status) {
                 if (this.isPress(channel, control, value, status)) {
-                    deck.vinylMode = !deck.vinylMode;
-                    this.send(deck.vinylMode ? 0x7F : 0x00);
+                    deck.toggleMotor();
+                    this.send(deck.motorEnabled ? 0x7F : 0x00);
                 }
             },
         }));
@@ -555,6 +643,7 @@ NS7II.init = function(id, debugging) {
 };
 
 NS7II.shutdown = function() {
+    NS7II.decks.forEach(function(d) { d.motorStop(); });
     // Turn off every LED we know about.
     var off = function(desc) {
         Object.keys(desc.controls || desc).forEach(function(id) {
