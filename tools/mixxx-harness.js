@@ -24,7 +24,8 @@ const engine = {
   beginTimer: () => 1, stopTimer: () => {}, getSetting: () => undefined, log: () => {},
 };
 const midi = { sendShortMsg: (s, n, v) => { log.push(['midi', s, n, v]); }, sendSysexMsg: () => {} };
-const ctx = { engine, midi, console, print: console.log, script: { midiDebug: () => {} }, HIDPacket: undefined };
+// Only the globals every Mixxx version provides: no console (missing in 2.3), no print.
+const ctx = { engine, midi, script: { midiDebug: () => {} } };
 vm.createContext(ctx);
 for (const lib of compPath.split(',')) {
   let src = fs.readFileSync(lib, 'utf8');

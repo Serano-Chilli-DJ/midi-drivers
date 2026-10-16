@@ -650,7 +650,8 @@ NS7II.init = function(id, debugging) {
     NS7II.decks = NS7II.MAP.decks.map(function(d) { return new NS7II.Deck(d); });
     NS7II.mixer = NS7II.MAP.mixer.map(function(m) { return new NS7II.MixerChannel(m); });
     NS7II.master = new NS7II.Master(NS7II.MAP.master || {});
-    console.log("NS7II mapping loaded: " + NS7II.decks.length + " decks, " + NS7II.mixer.length + " mixer channels");
+    // engine.log exists in every Mixxx version; `console` does not exist in 2.3.
+    engine.log("NS7II mapping loaded: " + NS7II.decks.length + " decks, " + NS7II.mixer.length + " mixer channels");
 };
 
 NS7II.shutdown = function() {
