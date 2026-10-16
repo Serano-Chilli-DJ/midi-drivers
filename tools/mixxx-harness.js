@@ -1,6 +1,14 @@
 const fs = require('fs');
 const vm = require('vm');
-const [,, compPath, scriptPath, xmlPath] = process.argv;
+// usage: node mixxx-harness.js LIB[,LIB...] SCRIPT XML [--qtscript]
+//   LIB       Mixxx library files loaded before the script, in order
+//             (lodash.mixxx.js,midi-components-0.0.js for Mixxx 2.3)
+//   --qtscript  emulate Mixxx 2.3: its QtScript engine calls a makeConnection
+//             callback with the `this` of the function that registered it,
+//             which the 2.3 components library relies on instead of bind().
+const args = process.argv.slice(2);
+const qtscript = args.includes('--qtscript');
+const [compPath, scriptPath, xmlPath] = args.filter(a => a !== '--qtscript');
 const values = {};
 const log = [];
 const engine = {
@@ -18,7 +26,14 @@ const engine = {
 const midi = { sendShortMsg: (s, n, v) => { log.push(['midi', s, n, v]); }, sendSysexMsg: () => {} };
 const ctx = { engine, midi, console, print: console.log, script: { midiDebug: () => {} }, HIDPacket: undefined };
 vm.createContext(ctx);
-vm.runInContext(fs.readFileSync(compPath, 'utf8'), ctx, { filename: 'components' });
+for (const lib of compPath.split(',')) {
+  let src = fs.readFileSync(lib, 'utf8');
+  if (qtscript) {
+    src = src.replace(/engine\.makeConnection\(([^;]*?)\s*,\s*(this\.output|function\s*\([^)]*\)\s*\{[\s\S]*?\n\s*\})\s*\);/g,
+      (m, head, cb) => `engine.makeConnection(${head}, (${cb}).bind(this));`);
+  }
+  vm.runInContext(src, ctx, { filename: require('path').basename(lib) });
+}
 vm.runInContext(fs.readFileSync(scriptPath, 'utf8'), ctx, { filename: 'script' });
 vm.runInContext('NS7II.init("Numark NS7II", false);', ctx);
 const xml = fs.readFileSync(xmlPath, 'utf8');

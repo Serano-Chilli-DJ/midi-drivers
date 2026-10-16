@@ -206,6 +206,49 @@ fn mixxx_controllers_dir() -> Option<String> {
         .map(|d| format!("{d}/controllers"))
 }
 
+/// Folders where a native, Flatpak or Snap Mixxx keeps its bundled
+/// controller scripts, plus the one next to a `mixxx` binary on PATH.
+fn mixxx_resource_dirs() -> Vec<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = [
+        "/usr/share/mixxx/controllers".to_string(),
+        "/usr/local/share/mixxx/controllers".to_string(),
+        "/opt/mixxx/share/mixxx/controllers".to_string(),
+        "/var/lib/flatpak/app/org.mixxx.Mixxx/current/active/files/share/mixxx/controllers".to_string(),
+        format!("{home}/.local/share/flatpak/app/org.mixxx.Mixxx/current/active/files/share/mixxx/controllers"),
+        "/snap/mixxx/current/usr/share/mixxx/controllers".to_string(),
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if let Ok(real) = std::fs::canonicalize(dir.join("mixxx")) {
+                if let Some(prefix) = real.parent().and_then(|p| p.parent()) {
+                    dirs.push(prefix.join("share/mixxx/controllers"));
+                }
+            }
+        }
+    }
+    dirs.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+/// Warnings for Mixxx libraries the mapping lists that no Mixxx install on
+/// this machine provides. Silent when no Mixxx controllers folder exists at
+/// all, since the mapping may be generated on another machine.
+fn missing_mixxx_libs() -> Vec<String> {
+    let dirs = mixxx_resource_dirs();
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    let shown: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+    mixxx::MIXXX_LIBS
+        .iter()
+        .filter(|lib| !dirs.iter().any(|d| d.join(lib).is_file()))
+        .map(|lib| format!("warning: the mapping loads {lib} from Mixxx but it is missing from {}; Mixxx ships it in res/controllers, copy it next to the mapping", shown.join(", ")))
+        .collect()
+}
+
 fn open(cli: &Cli) -> Result<Ns7ii, Box<dyn std::error::Error>> {
     let dev = Ns7ii::find()?.ok_or("no NS7II (15e4:002c) found; is it powered on and plugged in?")?;
     let ns = Ns7ii::open(dev, &overrides(cli))?;
@@ -413,6 +456,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("{n}");
             }
             println!("wrote {xml_path}\nwrote {js_path}");
+            for w in missing_mixxx_libs() {
+                eprintln!("{w}");
+            }
             println!("Now: start the driver (systemctl start ns7iid), start Mixxx, open Preferences > Controllers,");
             println!("click \"Numark NS7II\" in the left list, choose \"Numark NS7II\" under Load Mapping, enable, Apply.");
             println!("Mixxx reads this folder only at start-up, so restart it if it was running.");

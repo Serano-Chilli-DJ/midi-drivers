@@ -231,6 +231,10 @@ fn binding_json(b: &Binding) -> Value {
 
 /// Generate both files. Returns `(xml, js, notes)`; the notes summarise
 /// what was mapped and what the capture is still missing.
+/// Script libraries shipped with Mixxx (`res/controllers`) that the mapping
+/// loads before its own script, in this order.
+pub const MIXXX_LIBS: [&str; 2] = ["lodash.mixxx.js", "midi-components-0.0.js"];
+
 pub fn generate(learned: &Learned) -> Result<(String, String, Vec<String>), Box<dyn std::error::Error>> {
     let template = include_str!("../templates/Numark-NS7II-scripts.js");
     let mut xml = Xml { controls: String::new(), outputs: String::new() };
@@ -358,7 +362,12 @@ pub fn generate(learned: &Learned) -> Result<(String, String, Vec<String>), Box<
         xml_escape(&learned.firmware)
     );
     out.push_str("    </info>\n    <controller id=\"Numark NS7II\">\n        <scriptfiles>\n");
-    out.push_str("            <file functionprefix=\"\" filename=\"midi-components-0.0.js\"/>\n");
+    // Mixxx's own libraries, from its controllers folder. Mixxx 2.3's
+    // components library needs lodash and expects the mapping to list it;
+    // later versions do not need it but still ship it, so it is harmless.
+    for lib in MIXXX_LIBS {
+        let _ = writeln!(out, "            <file functionprefix=\"\" filename=\"{lib}\"/>");
+    }
     out.push_str("            <file functionprefix=\"NS7II\" filename=\"Numark-NS7II-scripts.js\"/>\n");
     out.push_str("        </scriptfiles>\n        <controls>\n");
     out.push_str(&xml.controls);
@@ -438,6 +447,10 @@ mod tests {
         l.sections.insert("deck1".into(), d1);
         l.sections.insert("deck2".into(), d2);
         let (xml, js, _) = generate(&l).unwrap();
+        let lodash = xml.find("filename=\"lodash.mixxx.js\"").expect("lodash listed");
+        let comps = xml.find("filename=\"midi-components-0.0.js\"").expect("components listed");
+        let own = xml.find("filename=\"Numark-NS7II-scripts.js\"").expect("script listed");
+        assert!(lodash < comps && comps < own, "libraries must load before the script");
         assert!(xml.contains("<status>0xB1</status>"));
         assert!(xml.contains("NS7II.decks[1].rate.input"));
         assert!(js.contains("\"number\": 2"));

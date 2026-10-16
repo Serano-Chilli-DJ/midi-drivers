@@ -77,7 +77,11 @@ folder Mixxx scans for user mappings:
 | Snap | `~/snap/mixxx/current/.mixxx/controllers/` |
 
 It picks whichever of these settings folders exists; `--out-dir` overrides
-it. Mixxx reads the folder only at start-up, so restart Mixxx afterwards,
+it. The mapping loads Mixxx's own `lodash.mixxx.js` and
+`midi-components-0.0.js` libraries and works on Mixxx 2.3 (whose QtScript
+engine only understands ES5) and newer; `mixxx-map` warns if a Mixxx
+install on the machine lacks either file.
+Mixxx reads the folder only at start-up, so restart Mixxx afterwards,
 make sure the driver is running (the controller only appears in Mixxx
 while `ns7iid` runs), open Preferences, Controllers, click "Numark NS7II" in
 the list on the left, choose "Numark NS7II" under Load Mapping, tick
