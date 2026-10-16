@@ -11,6 +11,35 @@
 /* eslint-disable */
 var NS7II = {};
 
+// Absolute fader or knob with deterministic 7-bit and 14-bit handling. The
+// NS7II sends the MSB (CC n) and then the LSB (CC n + 0x20) of a 14-bit
+// control; the library Pot's 14-bit code differs between Mixxx versions
+// (2.3 stores the combined value as the MSB once, which throws the fader
+// to the top), so the maths lives here. Soft takeover is off unless asked
+// for: the mixer and master controls have no layers, so their Mixxx
+// controls should follow the hardware exactly instead of waiting for the
+// fader to cross the old position.
+NS7II.absPot = function(opts) {
+    var p = new components.Pot(opts);
+    p.softTakeover = !!opts.softTakeover;
+    p.msb = undefined;
+    p.setFraction = function(v) {
+        if (this.invert) { v = 1 - v; }
+        engine.setParameter(this.group, this.inKey, Math.max(0, Math.min(1, v)));
+        if (!this.firstValueReceived) {
+            this.firstValueReceived = true;
+            this.connect();
+        }
+    };
+    p.input = function(channel, control, value) { this.setFraction(value / 127); };
+    p.inputMSB = function(channel, control, value) { this.msb = value; };
+    p.inputLSB = function(channel, control, value) {
+        if (this.msb === undefined) { return; }
+        this.setFraction(((this.msb << 7) | value) / 16383);
+    };
+    return p;
+};
+
 // The XML loads Mixxx's own lodash.mixxx.js and midi-components-0.0.js before
 // this file (Mixxx 2.3's components library needs lodash). Without them every
 // control below is undefined, so fail here with a message that says what is
@@ -111,13 +140,12 @@ NS7II.Deck = function(desc) {
             }));
             return;
         }
-        var opts = {midi: b.midi, group: group, inKey: inKey, invert: !!invert};
-        var p = new components.Pot(opts);
+        // Deck pots keep soft takeover: the same fader serves decks 1/3 or 2/4.
+        var opts = {midi: b.midi, group: group, inKey: inKey, invert: !!invert, softTakeover: true};
+        var p = NS7II.absPot(opts);
         if (b.type === "pitchbend") {
-            p.input = function(channel, control, value, status, g) {
-                var v14 = (value << 7) | control;
-                this.max = 16383;
-                components.Pot.prototype.input.call(this, channel, control, v14, status, g);
+            p.input = function(channel, control, value) {
+                this.setFraction(((value << 7) | control) / 16383);
             };
         }
         add(id, p);
@@ -541,7 +569,7 @@ NS7II.MixerChannel = function(desc) {
     var qf = "[QuickEffectRack1_" + group + "]";
     var pot = function(id, g, inKey) {
         if (!c[id]) { return; }
-        self[NS7II.camel(id)] = new components.Pot({midi: c[id].midi, group: g, inKey: inKey});
+        self[NS7II.camel(id)] = NS7II.absPot({midi: c[id].midi, group: g, inKey: inKey});
     };
     pot("gain", group, "pregain");
     pot("treble", eq, "parameter3");
@@ -583,7 +611,7 @@ NS7II.Master = function(c) {
     var self = this;
     var pot = function(id, g, inKey) {
         if (!c[id]) { return; }
-        self[NS7II.camel(id)] = new components.Pot({midi: c[id].midi, group: g, inKey: inKey});
+        self[NS7II.camel(id)] = NS7II.absPot({midi: c[id].midi, group: g, inKey: inKey});
     };
     pot("crossfader", "[Master]", "crossfader");
     pot("master", "[Master]", "gain");
