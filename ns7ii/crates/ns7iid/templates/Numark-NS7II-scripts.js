@@ -62,6 +62,7 @@ NS7II.settings = {
     rpm: 33 + 1 / 3,            // 33.333 or 45
     motorPitchFullScale: 1.0,   // platter speed change at full deflection of the 14-bit motor pitch value (unverified: 1.0 = +100%)
     scratchRelease: 150,        // ms without platter ticks before scratch mode ends when the motor is off
+    motorTimeout: 1500,         // ms to wait for platter ticks after a motor start before giving up on the motor
     loopSizes: [0.125, 0.25, 0.5, 1, 2, 4, 8, 16],
     jumpSizes: [1, 2, 4, 8],
     browseAccel: 5,             // rows per click with SHIFT
@@ -219,18 +220,35 @@ NS7II.Deck = function(desc) {
         deck.motorSend(0x69, v >> 7);
         deck.motorSend(0x49, v & 0x7F);
     };
+    // The motor counts as running only once the platter reports ticks: if
+    // the start command never reaches the unit (no MIDI output path, wrong
+    // protocol), the deck must keep playing normally instead of sitting in
+    // scratch mode waiting for a platter that is not moving.
+    this.motorPending = 0;
     this.motorStart = function() {
         if (!deck.motorEnabled || ccStatus === null) { return; }
         deck.motorSend(0x45, NS7II.settings.rpm > 40 ? 1 : 0);
         deck.motorSend(0x46, engine.getValue(deck.group, "reverse") > 0 ? 1 : 0);
         deck.sendMotorPitch();
         deck.motorSend(0x43, 0);
+        if (deck.motorPending) { engine.stopTimer(deck.motorPending); }
+        deck.motorPending = engine.beginTimer(NS7II.settings.motorTimeout, function() {
+            deck.motorPending = 0;
+            if (!deck.motorRunning) {
+                engine.log("NS7II deck " + n + ": motor did not respond within " + NS7II.settings.motorTimeout +
+                    " ms; playing without it (check that Mixxx has an output to the controller)");
+            }
+        }, true);
+    };
+    this.motorConfirmed = function() {
+        if (deck.motorPending) { engine.stopTimer(deck.motorPending); deck.motorPending = 0; }
         deck.motorRunning = true;
         deck.scratchOn();
     };
     this.motorStop = function() {
         if (ccStatus === null) { return; }
         deck.motorSend(0x44, 0);
+        if (deck.motorPending) { engine.stopTimer(deck.motorPending); deck.motorPending = 0; }
         deck.motorRunning = false;
         deck.scratchOff();
     };
@@ -307,6 +325,7 @@ NS7II.Deck = function(desc) {
             },
             apply: function(d) {
                 if (d === 0) { return; }
+                if (deck.motorPending) { deck.motorConfirmed(); }
                 if (deck.motorRunning) {
                     engine.scratchTick(n, d);
                     return;
