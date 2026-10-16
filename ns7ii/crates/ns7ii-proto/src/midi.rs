@@ -11,6 +11,14 @@
 //! Ploytec firmware does not understand MIDI running status (Reloop, Ozzy
 //! reports), while the ALSA sequencer emits it by default, so outgoing
 //! streams are passed through [`RunningStatusExpander`]. **family**.
+//!
+//! MIDI OUT on the NS7II is not a raw byte stream. The kext's `AJ` class
+//! (`AJ::configurationDone` for device model 8, `AJ::fireOutputInternal`)
+//! sends fixed 42-byte transfers: the MIDI bytes first (at most 39 or 40 per
+//! transfer, `USBMidiPattern_NS7`), `0xFD` filler, and a control byte
+//! `0xE0` in the last slot. MIDI IN uses the same 42-byte frame, which is
+//! what the hardware showed. A bare 3-byte write completes on USB but the
+//! unit ignores it. [`frame_out`] builds those transfers. **kext, NS7**.
 
 /// Idle filler byte the firmware inserts into MIDI IN transfers.
 pub const IDLE_BYTE: u8 = 0xFD;
@@ -18,6 +26,57 @@ pub const IDLE_BYTE: u8 = 0xFD;
 pub const TICK_BYTE: u8 = 0xF9;
 /// Control byte that follows a MIDI slot on the Xone family.
 pub const CONTROL_IDLE: u8 = 0xFF;
+/// Size of one NS7II MIDI OUT (and IN) transfer.
+pub const OUT_FRAME_LEN: usize = 42;
+/// MIDI bytes the kext puts in one NS7II MIDI OUT transfer at most (the
+/// NS7 pattern alternates 39 and 40; 39 is always within it).
+pub const OUT_FRAME_PAYLOAD: usize = 39;
+/// Control byte in the last slot of an NS7II MIDI OUT transfer (`AJ::init`
+/// and `AJ::configurationDone` default for non-bulk devices).
+pub const OUT_CONTROL_BYTE: u8 = 0xE0;
+
+/// Split an outgoing MIDI byte stream into NS7II MIDI OUT transfers.
+///
+/// Each transfer is [`OUT_FRAME_LEN`] bytes: payload, [`IDLE_BYTE`] filler,
+/// [`OUT_CONTROL_BYTE`] last. Channel messages are kept whole within a
+/// transfer; SysEx and other long runs are split wherever the payload
+/// limit falls, as the kext does.
+pub fn frame_out(bytes: &[u8]) -> Vec<[u8; OUT_FRAME_LEN]> {
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let mut end = (pos + OUT_FRAME_PAYLOAD).min(bytes.len());
+        if end < bytes.len() {
+            // Back off to a message boundary when the cut would split a
+            // channel-voice or system-common message.
+            let mut i = pos;
+            let mut boundary = pos;
+            while i < end {
+                let b = bytes[i];
+                let len = if b >= 0xF8 { 1 } else if b >= 0x80 { 1 + data_bytes_for(b) as usize } else { 1 };
+                if b == 0xF0 || b < 0x80 {
+                    boundary = i + 1;
+                    i += 1;
+                    continue;
+                }
+                if i + len > end {
+                    break;
+                }
+                i += len;
+                boundary = i;
+            }
+            if boundary > pos {
+                end = boundary;
+            }
+        }
+        let mut frame = [IDLE_BYTE; OUT_FRAME_LEN];
+        frame[..end - pos].copy_from_slice(&bytes[pos..end]);
+        frame[OUT_FRAME_LEN - 1] = OUT_CONTROL_BYTE;
+        frames.push(frame);
+        pos = end;
+    }
+    frames
+}
 
 /// Strip firmware filler from a MIDI IN transfer.
 ///
@@ -408,5 +467,41 @@ mod tests {
         assert_eq!(e.push(0, 0xF8), Some([0x0F, 0xF8, 0, 0]));
         let mut out = [0u8; 3];
         assert_eq!(usb_midi::decode([0x0F, 0xF8, 0, 0], &mut out), 1);
+    }
+
+    #[test]
+    fn frame_out_pads_one_message_into_a_42_byte_transfer() {
+        let f = frame_out(&[0x92, 0x34, 0x7F]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(&f[0][..3], &[0x92, 0x34, 0x7F]);
+        assert!(f[0][3..41].iter().all(|b| *b == IDLE_BYTE));
+        assert_eq!(f[0][41], OUT_CONTROL_BYTE);
+    }
+
+    #[test]
+    fn frame_out_splits_on_message_boundaries() {
+        let msgs: Vec<u8> = (0..14u8).flat_map(|i| [0x91, 0x30 + i, 0x7F]).collect(); // 42 bytes
+        let f = frame_out(&msgs);
+        assert_eq!(f.len(), 2);
+        assert_eq!(&f[0][..39], &msgs[..39]);
+        assert_eq!(f[0][39], IDLE_BYTE);
+        assert_eq!(&f[1][..3], &msgs[39..]);
+        assert!(f[1][3..41].iter().all(|b| *b == IDLE_BYTE));
+        let three_byte_then_two: Vec<u8> = (0..12).flat_map(|_| [0x91u8, 0x30, 0x7F]).chain([0xC1, 0x05, 0x92, 0x31, 0x7F]).collect();
+        let f = frame_out(&three_byte_then_two); // 36 + 2 = 38 fit, the 3-byte message moves to the next frame
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0][38], IDLE_BYTE);
+        assert_eq!(&f[1][..3], &[0x92, 0x31, 0x7F]);
+    }
+
+    #[test]
+    fn frame_out_splits_sysex_anywhere() {
+        let mut sysex = vec![0xF0, 0x00, 0x01];
+        sysex.extend(std::iter::repeat_n(0x11u8, 60));
+        sysex.push(0xF7);
+        let f = frame_out(&sysex);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0][..39], sysex[..39]);
+        assert_eq!(f[1][..25], sysex[39..]);
     }
 }

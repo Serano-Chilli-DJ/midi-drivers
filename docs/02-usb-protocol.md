@@ -94,6 +94,14 @@ reason to trust the device's own reply).
   other Ploytec firmware) are stripped on input. **family**
 * Ploytec firmware ignores running status, so the driver expands it before
   sending. **family**
+* MIDI OUT transfers on the NS7II are 42 bytes: MIDI bytes first (at most
+  39-40 per transfer, kext table `USBMidiPattern_NS7`), `FD` filler, and
+  `E0` as the last byte (kext `AJ::configurationDone` picks 42 bytes and
+  the NS7 pattern for device model 8; `AJ::fireOutputInternal` fills the
+  frame). MIDI IN transfers are 42 bytes too (seen on hardware). A bare
+  3-byte bulk write completes but the unit ignores it (seen on hardware).
+  The output pipe is only serviced while the audio streams run
+  (`AJ::streamingStarted`). **kext; LED test pending**
 * If the device has a class-compliant MIDIStreaming interface, Linux's
   `snd-usb-audio` already provides it and the daemon leaves it alone unless
   `--take-class-midi` is given (the bridge box needs that).

@@ -469,11 +469,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::MidiSend { bytes } => {
             let ns = open(&cli)?;
-            let _ = ns.handshake(cli.rate);
+            let fw = ns.handshake(cli.rate)?;
             let msg: Vec<u8> = bytes.iter().map(|b| parse_hex8(b)).collect::<Result<_, _>>()?;
             let expanded = RunningStatusExpander::new().expand(&msg);
+            // The unit only services its MIDI pipes while the audio streams run
+            // (the kext enables MIDI output in AJ::streamingStarted), so run
+            // silent streams around the write.
+            let audio = AudioBackground::start(&ns, &fw, cli.codec, cli.rate)?;
+            std::thread::sleep(Duration::from_millis(300));
             let n = ns.midi_write(&expanded)?;
-            println!("sent {n} bytes: {}", hex(&expanded));
+            std::thread::sleep(Duration::from_millis(300));
+            audio.stop(&ns);
+            println!("sent {n} bytes: {} (as {} 42-byte transfer(s))", hex(&expanded), ns7ii_proto::midi::frame_out(&expanded).len());
             Ok(())
         }
         Cmd::Record { out, seconds, channels } => {

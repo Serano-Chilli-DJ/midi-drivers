@@ -392,12 +392,18 @@ impl Ns7ii {
     }
 
     /// Write one raw MIDI message to the MIDI OUT bulk endpoint (synchronous).
+    /// Send MIDI bytes to the control surface, framed as the NS7II expects
+    /// (42-byte transfers, see `ns7ii_proto::midi::frame_out`). Returns the
+    /// number of MIDI bytes sent.
     pub fn midi_write(&self, data: &[u8]) -> Result<usize> {
         let Some(ep) = &self.plan.midi_out else {
             return Err(Error::MissingEndpoint("MIDI OUT", "midi-out"));
         };
-        let mut buf = data.to_vec();
-        Ok(self.dev().bulk(ep.address, &mut buf, Duration::from_millis(1000))?)
+        for frame in ns7ii_proto::midi::frame_out(data) {
+            let mut buf = frame.to_vec();
+            self.dev().bulk(ep.address, &mut buf, Duration::from_millis(1000))?;
+        }
+        Ok(data.len())
     }
 
     /// Start an isochronous OUT stream fed by `source`.
