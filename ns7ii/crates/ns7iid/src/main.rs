@@ -9,6 +9,7 @@
 //! 4. `record`: capture audio to a WAV file; `play`: play a WAV or test tone.
 //! 5. `run`: the daemon — ALSA sequencer MIDI ports plus PCM bridging.
 
+mod chart;
 mod learn;
 mod mixxx;
 
@@ -86,11 +87,15 @@ enum Cmd {
         #[arg(long, default_value = "ns7ii-learn.json")]
         out: String,
     },
-    /// Generate a Mixxx mapping (XML + JS) from a capture file.
+    /// Generate a Mixxx mapping (XML + JS) from the built-in NS7II chart.
     MixxxMap {
-        /// Capture file from `midi-learn`.
-        #[arg(default_value = "ns7ii-learn.json")]
-        input: String,
+        /// Capture file from `midi-learn` whose entries override the built-in
+        /// chart (for a unit that differs, or to add a control).
+        #[arg(long)]
+        capture: Option<String>,
+        /// Use the capture alone and ignore the built-in chart.
+        #[arg(long, requires = "capture")]
+        capture_only: bool,
         /// Directory to write `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js` into.
         /// Default: this user's Mixxx controller folder (`~/.mixxx/controllers`, or the
         /// Flatpak / Snap equivalent, whichever exists).
@@ -371,11 +376,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ns.stop(stream.id);
             audio.stop(&ns);
             result?;
-            println!("next: ns7iid mixxx-map {out}      (writes the mapping into your Mixxx controllers folder)");
+            println!("next: ns7iid mixxx-map --capture {out}      (built-in chart, overridden by this capture)");
             Ok(())
         }
-        Cmd::MixxxMap { input, out_dir } => {
-            let learned = learn::Learned::load(input)?;
+        Cmd::MixxxMap { capture, capture_only, out_dir } => {
+            let mut learned = chart::builtin();
+            if let Some(path) = capture {
+                let cap = learn::Learned::load(path)?;
+                if *capture_only {
+                    learned = cap;
+                } else {
+                    let mut n = 0;
+                    for (sec, controls) in cap.sections {
+                        let target = learned.sections.entry(sec).or_default();
+                        for (id, c) in controls {
+                            target.insert(id, c);
+                            n += 1;
+                        }
+                    }
+                    println!("built-in chart with {n} controls overridden from {path}");
+                }
+            }
             let (xml, js, notes) = mixxx::generate(&learned)?;
             let out_dir = match out_dir {
                 Some(d) => d.clone(),

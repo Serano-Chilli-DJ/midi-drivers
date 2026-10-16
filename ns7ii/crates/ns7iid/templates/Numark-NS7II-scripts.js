@@ -44,6 +44,17 @@ NS7II.setShift = function(side, on) {
     on ? NS7II.master.shift() : NS7II.master.unshift();
 };
 
+// Controls in the map that this template has no handler for get a silent
+// component, so every XML binding resolves and nothing is reported as an error.
+NS7II.fillUnhandled = function(container, controls) {
+    Object.keys(controls).forEach(function(id) {
+        var name = NS7II.camel(id);
+        if (container[name] === undefined) {
+            container[name] = new components.Component({midi: controls[id].midi, input: function() {}, inputMSB: function() {}, inputLSB: function() {}});
+        }
+    });
+};
+
 // ---------------------------------------------------------------- Deck
 
 NS7II.Deck = function(desc) {
@@ -72,6 +83,19 @@ NS7II.Deck = function(desc) {
     var pot = function(id, group, inKey, invert) {
         if (!has(id)) { return; }
         var b = c[id];
+        if (b.type === "encoder") {
+            // Endless knob: step the parameter by 1/64 per click.
+            add(id, new components.Encoder({
+                midi: b.midi, group: group, inKey: inKey,
+                input: function(channel, control, value) {
+                    var d = NS7II.relDelta(value, "rel2c");
+                    if (Math.abs(d) > 32) { d = NS7II.relDelta(value, "rel64"); }
+                    var v = engine.getParameter(this.group, this.inKey) + d / 64;
+                    engine.setParameter(this.group, this.inKey, Math.max(0, Math.min(1, v)));
+                },
+            }));
+            return;
+        }
         var opts = {midi: b.midi, group: group, inKey: inKey, invert: !!invert};
         var p = new components.Pot(opts);
         if (b.type === "pitchbend") {
@@ -100,7 +124,15 @@ NS7II.Deck = function(desc) {
     simpleButton("loop_double", "loop_double", false);
     simpleButton("load", "LoadSelectedTrack", false);
     simpleButton("deck_select", "", false);
+    simpleButton("tap", "bpm_tap", false);
+    simpleButton("grid_adjust", "beats_translate_curpos", false);
+    simpleButton("grid_slip", "beats_translate_match_alignment", false);
     pot("rate", this.group, "rate", NS7II.settings.invertPitch);
+    for (var hc = 1; hc <= 5; hc++) {
+        if (has("hotcue" + hc)) {
+            add("hotcue" + hc, new components.HotcueButton({midi: midiOf("hotcue" + hc), number: hc, group: this.group}));
+        }
+    }
 
     if (has("range")) {
         add("range", new components.Button({
@@ -235,7 +267,9 @@ NS7II.Deck = function(desc) {
     }
 
     // Pad modes.
-    var modes = {pad_mode_cue: "hotcue", pad_mode_autoloop: "loop", pad_mode_slicer: "slicer", pad_mode_sampler: "sampler"};
+    var modes = {pad_mode_cue: "hotcue", pad_mode_autoloop: "loop", pad_mode_loop: "manualloop", pad_mode_slicer: "slicer", pad_mode_sampler: "sampler"};
+    // Manual loop mode: pad -> control, press only.
+    var manualLoop = ["loop_in", "loop_out", "reloop_toggle", "reloop_andstop", "loop_halve", "loop_double", "loop_move_1_backward", "loop_move_1_forward"];
     Object.keys(modes).forEach(function(id) {
         if (!has(id)) { return; }
         add(id, new components.Button({
@@ -292,6 +326,9 @@ NS7II.Deck = function(desc) {
                             engine.setValue(g, "beatjump_" + js + (i <= 4 ? "_backward" : "_forward"), 1);
                         }
                         break;
+                    case "manualloop":
+                        if (press) { engine.setValue(g, manualLoop[i - 1], 1); }
+                        break;
                     case "sampler":
                         var sg = "[Sampler" + (samplerBase + i) + "]";
                         if (press) {
@@ -324,6 +361,7 @@ NS7II.Deck = function(desc) {
             on = engine.getValue(g, "beatloop_" + size + "_enabled") > 0;
             break;
         case "slicer": on = true; break;
+        case "manualloop": on = (i <= 4) ? engine.getValue(g, "loop_enabled") > 0 : true; break;
         case "sampler": on = engine.getValue("[Sampler" + (samplerBase + i) + "]", "play") > 0; break;
         }
         pad.send(on ? 0x7F : 0x00);
@@ -337,6 +375,7 @@ NS7II.Deck = function(desc) {
     NS7II.settings.loopSizes.forEach(function(size) {
         deck.padConnections.push(engine.makeConnection(deck.group, "beatloop_" + size + "_enabled", function() { deck.refreshPads(); }));
     });
+    this.padConnections.push(engine.makeConnection(this.group, "loop_enabled", function() { deck.refreshPads(); }));
 
     var param = function(id, dir) {
         if (!has(id)) { return; }
@@ -383,12 +422,13 @@ NS7II.Deck = function(desc) {
     simpleButton("fx_tap", "next_chain", false, unitGroup);
     simpleButton("fx_assign", "group_" + this.group + "_enable", true, unitGroup);
 
+    NS7II.fillUnhandled(this, c);
     this.reconnectComponents(function(comp) {
         if (comp.group === undefined) { comp.group = deck.group; }
     });
     this.setPadMode("hotcue");
 };
-NS7II.Deck.prototype = new components.Deck();
+NS7II.Deck.prototype = Object.create(components.Deck.prototype);
 
 // ---------------------------------------------------------------- Mixer channel
 
@@ -413,8 +453,29 @@ NS7II.MixerChannel = function(desc) {
     if (c["pfl"]) {
         this.pfl = new components.Button({midi: c["pfl"].midi, group: group, key: "pfl", type: components.Button.prototype.types.toggle});
     }
+    // FX ASSIGN A/B: route this channel into effect unit 1/2.
+    ["fx_a", "fx_b"].forEach(function(id, k) {
+        if (!c[id]) { return; }
+        self[NS7II.camel(id)] = new components.Button({
+            midi: c[id].midi, group: "[EffectRack1_EffectUnit" + (k + 1) + "]", key: "group_" + group + "_enable",
+            type: components.Button.prototype.types.toggle,
+        });
+    });
+    // Crossfader assign switch: A = left, B = right, neither = centre (bypass).
+    var xf = function(id, side) {
+        if (!c[id]) { return; }
+        self[NS7II.camel(id)] = new components.Button({
+            midi: c[id].midi,
+            input: function(channel, control, value, status) {
+                engine.setValue(group, "orientation", this.isPress(channel, control, value, status) ? side : 1);
+            },
+        });
+    };
+    xf("xf_a", 0);
+    xf("xf_b", 2);
+    NS7II.fillUnhandled(this, c);
 };
-NS7II.MixerChannel.prototype = new components.ComponentContainer();
+NS7II.MixerChannel.prototype = Object.create(components.ComponentContainer.prototype);
 
 // ---------------------------------------------------------------- Master / library
 
@@ -431,6 +492,8 @@ NS7II.Master = function(c) {
     pot("cue_gain", "[Master]", "headGain");
     pot("cue_mix", "[Master]", "headMix");
     pot("mic", "[Microphone]", "pregain");
+    pot("mic_bass", "[EqualizerRack1_[Microphone]_Effect1]", "parameter1");
+    pot("mic_treble", "[EqualizerRack1_[Microphone]_Effect1]", "parameter3");
     if (c["sampler_vol"]) {
         this.samplerVol = new components.Pot({
             midi: c["sampler_vol"].midi,
@@ -461,8 +524,26 @@ NS7II.Master = function(c) {
     btn("fwd", "[Library]", "MoveFocusForward");
     btn("view", "[Master]", "maximize_library", true);
     btn("load_prepare", "[Library]", "AutoDjAddBottom");
+    btn("crates", "[Library]", "MoveFocusBackward");
+    btn("files", "[Library]", "MoveFocusForward");
+    btn("prepare", "[AutoDJ]", "enabled", true);
+    btn("master_fx_a", "[EffectRack1_EffectUnit1]", "group_[Master]_enable", true);
+    btn("master_fx_b", "[EffectRack1_EffectUnit2]", "group_[Master]_enable", true);
+    // Front-panel switches: the position is the state.
+    var sw = function(id, g, key) {
+        if (!c[id]) { return; }
+        self[NS7II.camel(id)] = new components.Button({
+            midi: c[id].midi,
+            input: function(channel, control, value, status) {
+                engine.setValue(g, key, this.isPress(channel, control, value, status) ? 1 : 0);
+            },
+        });
+    };
+    sw("split_cue", "[Master]", "headSplit");
+    sw("mic_on", "[Microphone]", "talkover");
+    NS7II.fillUnhandled(this, c);
 };
-NS7II.Master.prototype = new components.ComponentContainer();
+NS7II.Master.prototype = Object.create(components.ComponentContainer.prototype);
 
 // ---------------------------------------------------------------- Lifecycle
 

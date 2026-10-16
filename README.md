@@ -16,6 +16,7 @@ on hardware in minutes; see `docs/04-bring-up-guide.md`.
 | `docs/02-usb-protocol.md` | The protocol as reconstructed, with a confidence tag on every item |
 | `docs/03-converter-box.md` | USB-to-USB bridge: hardware choice, software stack, latency budget |
 | `docs/04-bring-up-guide.md` | Step-by-step hardware verification and what to send back |
+| `docs/05-midi-chart.md` | The NS7II MIDI chart (every button, knob, fader, LED and motor message) |
 | `ns7ii/` | Rust workspace (see below) |
 | `tools/` | Python scripts used to unpack the vendor packages (DMG, pkg, InstallShield, Mach-O disassembly) |
 | `udev/` | udev rule so the driver runs without root |
@@ -58,26 +59,16 @@ Then, with the NS7II plugged in:
 
 ## Mixxx mapping
 
-Mixxx has no NS7II mapping and Numark never published the MIDI chart, so
-the driver builds one from the unit itself:
+Mixxx has no NS7II mapping and Numark never published the MIDI chart. The
+chart is now reconstructed (`docs/05-midi-chart.md`) and built into the
+driver, so a complete mapping is one command away:
 
 ```
-systemctl stop ns7iid                      # the service holds the device
-ns7iid midi-learn                          # ~10 minutes: touch each control when asked
-ns7iid mixxx-map                           # writes the mapping into Mixxx's controller folder
-systemctl start ns7iid
+ns7iid mixxx-map          # writes the mapping into Mixxx's controller folder
 ```
 
-`midi-learn` captures deck 1 completely, a few controls on decks 2 to 4 to
-learn the numbering, and all four mixer strips (the NS7II numbers them
-irregularly, so they cannot be extrapolated). The capture is saved to
-`ns7ii-learn.json` after every control; quit with `q` and run it again to
-resume, and delete an entry from the file to redo that control. Anything
-you skip is simply left out of the mapping, and `mixxx-map` lists what is
-still missing.
-
-`mixxx-map` writes `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js`
-into the folder Mixxx scans for user mappings:
+It writes `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js` into the
+folder Mixxx scans for user mappings:
 
 | Mixxx install | folder |
 |---------------|--------|
@@ -92,11 +83,18 @@ while `ns7iid` runs), open Preferences, Controllers, click "Numark NS7II" in
 the list on the left, choose "Numark NS7II" under Load Mapping, tick
 Enabled and Apply.
 
-The mapping covers platter scratching, strip search, pads in hot cue / loop
-/ beat-jump / sampler modes, loops, FX, mixer, library and LEDs. Decks 3
-and 4 are only mapped if their captures differ from decks 1 and 2, i.e. the
-DECK layer button was pressed during `midi-learn`; the tool warns at
-capture time if it was not.
+The mapping covers all four decks (DECK buttons switch layers), platters,
+strip search, the hot cue row, pads in hot cue / auto loop / manual loop /
+slicer / sampler modes, beat grid buttons, FX, mixer with FX and crossfader
+assign, library, microphone, front panel switches and LEDs. Settings such
+as pitch fader direction and platter resolution are at the top of
+`Numark-NS7II-scripts.js`.
+
+If a control on your unit does not match the chart, `midi-learn` still
+exists: it asks for each control in turn, saves to `ns7ii-learn.json`, and
+`mixxx-map --capture ns7ii-learn.json` lets the captured messages override
+the chart (`--capture-only` ignores the chart entirely). The service holds
+the device, so stop it first: `systemctl stop ns7iid`.
 
 ## One correction to the premise
 

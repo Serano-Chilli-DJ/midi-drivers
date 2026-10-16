@@ -251,7 +251,7 @@ pub fn generate(learned: &Learned) -> Result<(String, String, Vec<String>), Box<
         .collect();
     let ids: BTreeSet<String> = DECKS.iter().filter_map(|k| learned.sections.get(*k)).flat_map(|s| s.keys().cloned()).collect();
     let missing: Vec<String> = expected_ids("deck1").into_iter().filter(|id| !ids.contains(*id)).map(str::to_string).collect();
-    if !missing.is_empty() {
+    if !missing.is_empty() && !learned.complete {
         notes.push(format!("deck controls never captured on any deck (run midi-learn again to add them): {}", list(&missing)));
     }
     let mut decks_json = Vec::new();
@@ -273,6 +273,9 @@ pub fn generate(learned: &Learned) -> Result<(String, String, Vec<String>), Box<
         for id in &ids {
             let direct = learned.get(key, id).and_then(analyze);
             let derived = || {
+                if learned.complete {
+                    return None;
+                }
                 DECKS.iter().enumerate().find_map(|(j, k)| {
                     let src = offsets[j]?;
                     let b = learned.get(k, id).and_then(analyze)?;
@@ -465,7 +468,7 @@ mod tests {
         assert!(xml.contains("NS7II.decks[0].pad1.input"));
         let i = xml.find("NS7II.decks[0].pad1.input").unwrap();
         assert!(xml[i..].contains("<status>0x93</status>"));
-        assert!(notes.iter().any(|n| n.contains("never captured") && n.contains("keylock")));
+        assert!(notes.iter().any(|n| n.contains("never captured") && n.contains("pad2")));
     }
 
     #[test]
