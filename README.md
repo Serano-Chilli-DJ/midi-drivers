@@ -87,6 +87,13 @@ while `ns7iid` runs), open Preferences, Controllers, click "Numark NS7II" in
 the list on the left, choose "Numark NS7II" under Load Mapping, tick
 Enabled and Apply.
 
+The NS7II is a four-deck controller. Its mixer strips are, from left to
+right, channels 3, 1, 2 and 4, and each side's DECK buttons switch that
+side between decks 1/3 or 2/4; every message carries its deck number, so
+the outer strips and the DECK 3 / DECK 4 layers land on Mixxx decks 3 and
+4. Most Mixxx skins hide those until you switch the skin to four decks, so
+either do that or press DECK 1 and DECK 2 on the unit.
+
 The mapping covers all four decks (DECK buttons switch layers), platters,
 strip search, the hot cue row, pads in hot cue / auto loop / manual loop /
 slicer / sampler modes, beat grid buttons, FX, mixer with FX and crossfader
