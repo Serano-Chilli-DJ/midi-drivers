@@ -157,7 +157,12 @@ impl Alsa {
         }
     }
 
-    /// Open a sequencer client named `name` with an input and an output port.
+    /// Open a sequencer client named `name` with one duplex port called
+    /// `<name> MIDI 1`, the shape the kernel gives class-compliant devices.
+    /// Mixxx pairs a controller's input and output by port name and only
+    /// treats identical names (or `... MIDI <n>` pairs) as one device, so
+    /// separate "MIDI in" / "MIDI out" ports leave it without an output
+    /// path: no LEDs and no motor commands.
     pub fn open_seq(&self, name: &str) -> Result<SeqPort> {
         let mut seq: *mut SndSeq = ptr::null_mut();
         let dflt = CString::new("default").unwrap();
@@ -166,15 +171,12 @@ impl Alsa {
         let cname = CString::new(name).unwrap();
         // SAFETY: `seq` is a valid handle from snd_seq_open.
         self.check("snd_seq_set_client_name", unsafe { (self.api.seq_set_client_name)(seq, cname.as_ptr()) })?;
-        let in_name = CString::new(format!("{name} MIDI in")).unwrap();
-        let out_name = CString::new(format!("{name} MIDI out")).unwrap();
-        let caps_out = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
-        let caps_in = SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE;
+        let port_name = CString::new(format!("{name} MIDI 1")).unwrap();
+        let caps = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ | SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE;
         let ptype = SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_HARDWARE | SND_SEQ_PORT_TYPE_PORT;
-        // SAFETY: valid handle and NUL-terminated names.
-        let out_port = self.check("snd_seq_create_simple_port", unsafe { (self.api.seq_create_simple_port)(seq, in_name.as_ptr(), caps_out, ptype) })?;
-        // SAFETY: as above.
-        let in_port = self.check("snd_seq_create_simple_port", unsafe { (self.api.seq_create_simple_port)(seq, out_name.as_ptr(), caps_in, ptype) })?;
+        // SAFETY: valid handle and NUL-terminated name.
+        let port = self.check("snd_seq_create_simple_port", unsafe { (self.api.seq_create_simple_port)(seq, port_name.as_ptr(), caps, ptype) })?;
+        let (out_port, in_port) = (port, port);
         let mut enc: *mut SndMidiEvent = ptr::null_mut();
         let mut dec: *mut SndMidiEvent = ptr::null_mut();
         // SAFETY: out-pointers receive freshly allocated parsers.
@@ -209,7 +211,8 @@ impl Alsa {
     }
 }
 
-/// ALSA sequencer client with one input and one output port.
+/// ALSA sequencer client with one duplex port (kept as two fields in case a
+/// device ever needs them split again).
 pub struct SeqPort {
     alsa: std::sync::Arc<Api>,
     seq: *mut SndSeq,

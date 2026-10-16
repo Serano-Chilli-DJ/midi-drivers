@@ -460,7 +460,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{w}");
             }
             println!("Now: start the driver (systemctl start ns7iid), start Mixxx, open Preferences > Controllers,");
-            println!("click \"Numark NS7II\" in the left list, choose \"Numark NS7II\" under Load Mapping, enable, Apply.");
+            println!("click \"Numark NS7II MIDI 1\" in the left list, choose \"Numark NS7II\" under Load Mapping, enable, Apply.");
             println!("Mixxx reads this folder only at start-up, so restart it if it was running.");
             println!("The NS7II is a four-deck controller: the outer mixer strips (printed 3 and 4) and the DECK 3 / DECK 4");
             println!("layers drive Mixxx decks 3 and 4, which most skins hide until you switch them to four decks.");

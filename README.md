@@ -84,7 +84,7 @@ install on the machine lacks either file.
 Mixxx reads the folder only at start-up, so restart Mixxx afterwards,
 make sure the driver is running (the controller only appears in Mixxx
 while `ns7iid` runs), open Preferences, Controllers, click "Numark NS7II" in
-the list on the left, choose "Numark NS7II" under Load Mapping, tick
+the list on the left (the controller appears as "Numark NS7II MIDI 1"), choose "Numark NS7II" under Load Mapping, tick
 Enabled and Apply.
 
 The NS7II is a four-deck controller. Its mixer strips are, from left to
