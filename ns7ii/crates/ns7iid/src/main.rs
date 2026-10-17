@@ -129,10 +129,10 @@ enum Cmd {
     },
     /// Run as a daemon: ALSA sequencer MIDI ports and PCM bridging.
     Run {
-        /// ALSA PCM to read playback audio from (what apps play into), e.g. hw:Loopback,1,0.
+        /// ALSA PCM to read playback audio from, e.g. hw:Loopback,1,0 (apps play into hw:Loopback,0,0).
         #[arg(long)]
         pcm_out: Option<String>,
-        /// ALSA PCM to write captured audio to (what apps record from), e.g. hw:Loopback,1,1.
+        /// ALSA PCM to write captured audio to, e.g. hw:Loopback,1,0 (apps record from hw:Loopback,0,0).
         #[arg(long)]
         pcm_in: Option<String>,
         /// Disable MIDI bridging.

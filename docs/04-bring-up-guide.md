@@ -95,10 +95,14 @@ sound and no errors, try `--codec junction`, then a different `--play-ep`.
 
 ```
 sudo modprobe snd-aloop
-ns7iid run --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,1
+ns7iid run --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,0
 ```
 
-Point Mixxx at `hw:Loopback,0,0` (output) and `hw:Loopback,0,1` (input) and
+Both bridges use subdevice 0 of loopback device 1, so apps play into and
+record from the same `hw:Loopback,0,0` (an app that opens
+`hw:CARD=Loopback,DEV=0` without a subdevice gets subdevice 0). The two
+directions are separate cables, so playback can be 4 channels and capture 12.
+Point Mixxx at `hw:Loopback,0,0` for both output and input and
 at the "Numark NS7II" MIDI ports. PipeWire users can instead use
 `pw-loopback` or just leave PipeWire on the loopback card.
 
