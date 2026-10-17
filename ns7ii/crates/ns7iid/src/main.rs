@@ -11,6 +11,7 @@
 
 mod bridge;
 mod chart;
+mod daemon;
 mod learn;
 mod midi_out;
 mod mixxx;
@@ -160,6 +161,14 @@ fn parse_hex8(s: &str) -> Result<u8, String> {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // A panic in any thread ends the process (status 101), so systemd restarts
+    // the service instead of leaving it running with a dead MIDI or audio thread.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |p| {
+        log::error!("panic: {p}; exiting");
+        default_hook(p);
+        std::process::exit(101);
+    }));
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("error: {e}");
@@ -606,7 +615,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 min_gap: Duration::from_millis(*midi_out_gap_ms),
                 ..midi_out::Config::default()
             };
-            run_daemon(&cli, pcm_out.clone(), pcm_in.clone(), *no_midi, client_name, midi_cfg)
+            let opts = daemon::Options {
+                overrides: overrides(&cli),
+                rate: cli.rate,
+                codec: cli.codec,
+                pcm_out: pcm_out.clone(),
+                pcm_in: pcm_in.clone(),
+                no_midi: *no_midi,
+                client_name: client_name.clone(),
+                midi: midi_cfg,
+            };
+            let status = daemon::run(opts, ctrl_c_flag())?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
         }
     }
 }
@@ -633,210 +656,6 @@ fn read_wav(path: &str, out_ch: usize, rate: u32) -> Result<Vec<i32>, Box<dyn st
         }
     }
     Ok(out)
-}
-
-fn run_daemon(
-    cli: &Cli,
-    pcm_out: Option<String>,
-    pcm_in: Option<String>,
-    no_midi: bool,
-    client_name: &str,
-    midi_cfg: midi_out::Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ns = Arc::new(open(cli)?);
-    let fw = ns.handshake(cli.rate)?;
-    let stop = ctrl_c_flag();
-    let alsa = ns7ii_alsa::Alsa::load()?;
-    let mut threads = Vec::new();
-    let midi_out = midi_out::Shared::new();
-
-    // MIDI: device -> sequencer and sequencer -> device.
-    if !no_midi {
-        if let Some(ep) = ns.plan().midi_in.clone() {
-            let mut seq = alsa.open_seq(client_name)?;
-            println!("ALSA MIDI ports: from device {}  to device {}", seq.source_address(), seq.sink_address());
-            let stream = ns.start_bulk_in(&ep, 4, 1)?;
-            let ns2 = Arc::clone(&ns);
-            let stop2 = Arc::clone(&stop);
-            let out = Arc::clone(&midi_out);
-            // Device -> apps, and apps -> the paced, coalescing MIDI OUT queue.
-            threads.push(std::thread::spawn(move || {
-                let mut clean = Vec::new();
-                let mut outgoing = Vec::new();
-                while !stop2.load(Ordering::SeqCst) {
-                    match stream.rx.recv_timeout(Duration::from_millis(2)) {
-                        Ok(raw) => {
-                            clean.clear();
-                            strip_filler(&raw, &mut clean);
-                            if !clean.is_empty() {
-                                if let Err(e) = seq.send(&clean) {
-                                    warn!("seq send: {e}");
-                                }
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                    outgoing.clear();
-                    if let Ok(n) = seq.receive(&mut outgoing) {
-                        if n > 0 {
-                            out.push(&outgoing);
-                        }
-                    }
-                }
-                ns2.stop(stream.id);
-            }));
-            if ns.plan().midi_out.is_some() {
-                let (out, stop2, ns2) = (Arc::clone(&midi_out), Arc::clone(&stop), Arc::clone(&ns));
-                threads.push(std::thread::spawn(move || midi_out::run(midi_cfg, out, stop2, move || Some(Arc::clone(&ns2)))));
-            }
-        } else if ns.plan().class_midi_interface.is_some() {
-            println!("MIDI: the device has a class-compliant MIDI interface; the kernel's snd-usb-audio provides it (see `aseqdump -l`).");
-        } else {
-            println!("MIDI: no raw MIDI endpoint found; pass --midi-in-ep/--midi-out-ep after checking `probe`.");
-        }
-    }
-
-    // Audio streams always run: the firmware forwards MIDI only while
-    // streaming. Without --pcm-in the capture data is discarded; without
-    // --pcm-out silence is played.
-    let in_ch = if fw.in_channels > 0 { fw.in_channels as usize } else { 12 };
-    let out_ch = if fw.out_channels > 0 { fw.out_channels as usize } else { 4 };
-    let in_codec = make_codec(cli.codec, in_ch, out_ch);
-    let out_codec = make_codec(cli.codec, in_ch, out_ch);
-    let is_junction = matches!(cli.codec, Codec::Junction);
-
-    // Playback: ALSA PCM (apps play into the other side of a loopback) -> device.
-    {
-        let ep = ns.plan().playback.clone().ok_or("no playback endpoint; pass --play-ep")?;
-        let frame_bytes = out_codec.out_frame_bytes();
-        let source = AudioSource::new();
-        let cfg = IsoOutConfig { rate: cli.rate, frame_bytes, packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
-        let (fb_tx, fb_rx) = mpsc::channel();
-        let fb_id = match &ns.plan().feedback {
-            Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
-            None => None,
-        };
-        let stream = ns.start_iso_out(&ep, cfg, source.clone())?;
-        let ns2 = Arc::clone(&ns);
-        let stop2 = Arc::clone(&stop);
-        let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
-        let mut pcm = match &pcm_out {
-            Some(name) => {
-                info!("playback bridge: reading {name} as {out_ch} ch S24_3LE {} Hz; a loopback's other end must be opened with the same format (or through plughw:)", cli.rate);
-                let (alsa, name2, rate) = (alsa.clone(), name.clone(), cli.rate);
-                Some(bridge::Bridge::start("playback bridge", name, move || alsa.open_pcm(&name2, true, out_ch as u32, rate, 50_000), Instant::now()))
-            }
-            None => None,
-        };
-        let rate = cli.rate;
-        threads.push(std::thread::spawn(move || {
-            let period = 256usize;
-            let mut in_bytes = vec![0u8; period * out_ch * 3];
-            let mut samples = vec![0i32; period * out_ch];
-            let mut wire = vec![0u8; period * frame_bytes];
-            // Keep roughly 20 ms queued ahead of the USB side.
-            let target = (rate as usize / 50) * frame_bytes;
-            while !stop2.load(Ordering::SeqCst) {
-                while let Ok(fp) = fb_rx.try_recv() {
-                    log::debug!("feedback {}.{:04x}", fp >> 16, fp & 0xFFFF);
-                }
-                let Some(pcm) = pcm.as_mut() else {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                };
-                if source.queued() > target {
-                    std::thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                match pcm.read(&mut in_bytes, Instant::now()) {
-                    Some(n) => {
-                        let got = plain.decode(&in_bytes[..n], &mut samples);
-                        let m = out_codec.encode(&samples[..got], &mut wire);
-                        source.push(&wire[..m]);
-                    }
-                    // Failing or waiting to reopen (logged, rate-limited);
-                    // the device plays silence meanwhile.
-                    None => std::thread::sleep(Duration::from_millis(20)),
-                }
-            }
-            ns2.stop(stream.id);
-            if let Some(id) = fb_id {
-                ns2.stop(id);
-            }
-        }));
-    }
-
-    // Capture: device -> ALSA PCM (apps record from the other side of a loopback).
-    {
-        let ep = ns.plan().capture.clone().ok_or("no capture endpoint; pass --capture-ep")?;
-        let mut pcm = match &pcm_in {
-            Some(name) => {
-                info!("capture bridge: writing {name} as {in_ch} ch S24_3LE {} Hz; a loopback's other end must be opened with the same format (or through plughw:)", cli.rate);
-                let (alsa, name2, rate) = (alsa.clone(), name.clone(), cli.rate);
-                Some(bridge::Bridge::start("capture bridge", name, move || alsa.open_pcm(&name2, false, in_ch as u32, rate, 50_000), Instant::now()))
-            }
-            None => None,
-        };
-        let frame_bytes = in_codec.in_frame_bytes();
-        let packets = if ep.kind == EndpointKind::Interrupt { 8 } else { 16 };
-        let stream = ns.start_bulk_in(&ep, 4, packets)?;
-        let ns2 = Arc::clone(&ns);
-        let stop2 = Arc::clone(&stop);
-        threads.push(std::thread::spawn(move || {
-            let mut pending = Vec::new();
-            let mut samples = vec![0i32; 8192 * in_ch];
-            let plain = Plain24 { out_channels: in_ch, in_channels: in_ch };
-            let mut out_bytes = Vec::new();
-            while !stop2.load(Ordering::SeqCst) {
-                match stream.rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok(raw) => {
-                        let Some(pcm) = pcm.as_mut() else { continue };
-                        pending.extend_from_slice(&raw);
-                        let usable = pending.len() - pending.len() % frame_bytes;
-                        let frames = usable / frame_bytes;
-                        if samples.len() < frames * in_ch {
-                            samples.resize(frames * in_ch, 0);
-                        }
-                        let n = in_codec.decode(&pending[..usable], &mut samples[..frames * in_ch]);
-                        let n_samples = if is_junction { n * in_ch } else { n };
-                        out_bytes.resize(n_samples * 3, 0);
-                        plain.encode(&samples[..n_samples], &mut out_bytes);
-                        // On error the block is dropped; the bridge logs and reopens.
-                        let _ = pcm.write(&out_bytes, Instant::now());
-                        pending.drain(..usable);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            ns2.stop(stream.id);
-        }));
-    }
-
-    println!("running; Ctrl-C to stop");
-    let mut failed = false;
-    while !stop.load(Ordering::SeqCst) {
-        if !ns.is_connected() {
-            info!("NS7II unplugged; exiting");
-            stop.store(true, Ordering::SeqCst);
-            break;
-        }
-        if let Some(why) = midi_out.take_fault() {
-            warn!("{why}; restarting");
-            stop.store(true, Ordering::SeqCst);
-            failed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    for t in threads {
-        let _ = t.join();
-    }
-    if failed {
-        return Err("device fault".into());
-    }
-    Ok(())
 }
 
 fn hex(b: &[u8]) -> String {
