@@ -702,7 +702,11 @@ fn run_daemon(
         let stop2 = Arc::clone(&stop);
         let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
         let mut pcm = match &pcm_out {
-            Some(name) => Some(alsa.open_pcm(name, true, out_ch as u32, cli.rate, 50_000)?),
+            Some(name) => {
+                let p = alsa.open_pcm(name, true, out_ch as u32, cli.rate, 50_000)?;
+                info!("playback bridge: reading {name} as {out_ch} ch S24_3LE {} Hz; a loopback's other end must be opened with the same format (or through plughw:)", cli.rate);
+                Some(p)
+            }
             None => None,
         };
         let rate = cli.rate;
@@ -748,7 +752,11 @@ fn run_daemon(
     {
         let ep = ns.plan().capture.clone().ok_or("no capture endpoint; pass --capture-ep")?;
         let mut pcm = match &pcm_in {
-            Some(name) => Some(alsa.open_pcm(name, false, in_ch as u32, cli.rate, 50_000)?),
+            Some(name) => {
+                let p = alsa.open_pcm(name, false, in_ch as u32, cli.rate, 50_000)?;
+                info!("capture bridge: writing {name} as {in_ch} ch S24_3LE {} Hz; a loopback's other end must be opened with the same format (or through plughw:)", cli.rate);
+                Some(p)
+            }
             None => None,
         };
         let frame_bytes = in_codec.in_frame_bytes();
