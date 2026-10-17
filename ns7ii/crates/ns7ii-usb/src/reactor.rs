@@ -85,7 +85,10 @@ impl Reactor {
         let f2 = Arc::clone(&fault);
         let thread = thread::Builder::new()
             .name("ns7ii-usb-reactor".into())
-            .spawn(move || run(d, rx, flag, f2))
+            .spawn(move || {
+                crate::usbfs::raise_thread_priority("USB reactor", 20);
+                run(d, rx, flag, f2)
+            })
             .expect("spawn reactor thread");
         Self { dev, tx, thread: Some(thread), next_id: AtomicUsize::new(1), disconnected, fault }
     }

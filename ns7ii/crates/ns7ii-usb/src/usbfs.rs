@@ -364,6 +364,24 @@ impl UsbfsDevice {
     }
 }
 
+/// Give the calling thread real-time (`SCHED_FIFO`) priority `prio`, so
+/// audio keeps flowing while the desktop is busy. Works when running as
+/// root (the systemd service) or with an RLIMIT_RTPRIO grant; otherwise the
+/// thread stays at normal priority, which is logged once at debug level.
+/// Returns whether it worked.
+pub fn raise_thread_priority(what: &str, prio: i32) -> bool {
+    let param = libc::sched_param { sched_priority: prio };
+    // SAFETY: plain syscall on the calling thread (pid 0) with a valid sched_param.
+    let r = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+    if r == 0 {
+        log::info!("{what} thread: real-time priority {prio} (SCHED_FIFO)");
+        true
+    } else {
+        log::debug!("{what} thread: no real-time priority ({}); running at normal priority", io::Error::last_os_error());
+        false
+    }
+}
+
 /// An asynchronous transfer: owns the kernel URB structure and the data buffer.
 ///
 /// The header and its isochronous packet descriptors live in one heap block
