@@ -15,6 +15,7 @@ mod daemon;
 mod learn;
 mod midi_out;
 mod mixxx;
+mod resample;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use log::{info, warn};

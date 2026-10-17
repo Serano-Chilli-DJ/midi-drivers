@@ -27,3 +27,7 @@ clap = { version = "4", features = ["derive"] }
 hound = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The audio DSP tests (resampler, simulated minutes of drift) are slow unoptimised.
+[profile.test]
+opt-level = 2
