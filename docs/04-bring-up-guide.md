@@ -98,6 +98,9 @@ sudo modprobe snd-aloop
 ns7iid run --pcm-out plughw:Loopback,1,0 --pcm-in plughw:Loopback,1,0
 ```
 
+(If `install.sh` already ran, the service owns the device: stop it first
+with `sudo systemctl stop ns7iid`.)
+
 Both bridges use subdevice 0 of loopback device 1, so apps play into and
 record from the same `plughw:CARD=Loopback,DEV=0` (subdevice 0 when none is
 given). The two directions are separate cables, so playback can be 4
@@ -115,6 +118,32 @@ formats agree.
 Point Mixxx at `plughw:CARD=Loopback,DEV=0` for both output and input and
 at the "Numark NS7II" MIDI ports. PipeWire users can instead use
 `pw-loopback` or just leave PipeWire on the loopback card.
+
+### As an installed service
+
+Once `ns7iid run` works by hand, `sudo ./install.sh ns7ii/target/release/ns7iid`
+(from the repo root, path to the binary you built) makes it permanent: the
+`Loopback` card loads at boot, and the service starts on plug-in with the
+plughw bridge above. Its settings are in `/etc/default/ns7iid`.
+
+```
+systemctl status ns7iid
+journalctl -u ns7iid -f
+aplay -D plughw:CARD=Loopback,DEV=0 -r 44100 -c 2 some.wav    # sound on Master OUT
+cat /proc/asound/cards                                        # a "Loopback" card
+```
+
+Apps should open `plughw:CARD=Loopback,DEV=0` for output and input. If the
+journal repeats `I/O failed ... Input/output error`, an app holds the
+loopback in a format ns7iid cannot convert to; switch the app to plughw.
+
+* MIDI only: set `NS7IID_AUDIO=0` in `/etc/default/ns7iid`, then
+  `sudo systemctl restart ns7iid`.
+* Run by hand for debugging: `sudo systemctl stop ns7iid`, then
+  `RUST_LOG=debug ns7iid run --pcm-out plughw:Loopback,1,0 --pcm-in plughw:Loopback,1,0`.
+* Roll back: `sudo ./install.sh --uninstall` removes the binary, unit,
+  helper, udev rule and module config (and `/etc/default/ns7iid` unless
+  edited); reboot or `sudo modprobe -r snd-aloop` to drop the card.
 
 ## Step 7: Mixxx mapping
 

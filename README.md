@@ -20,6 +20,7 @@ on hardware in minutes; see `docs/04-bring-up-guide.md`.
 | `ns7ii/` | Rust workspace (see below) |
 | `tools/` | Python scripts used to unpack the vendor packages (DMG, pkg, InstallShield, Mach-O disassembly) |
 | `udev/` | udev rule so the driver runs without root |
+| `systemd/`, `modules/`, `install.sh` | the service, its settings, the snd-aloop card config and the installer |
 | `tmp/` | The vendor downloads (not tracked) |
 
 ## Rust workspace
@@ -56,6 +57,50 @@ Then, with the NS7II plugged in:
 ./target/release/ns7iid play --seconds 5          # 440 Hz test tone on every output
 ./target/release/ns7iid run --pcm-out plughw:Loopback,1,0 --pcm-in plughw:Loopback,1,0
 ```
+
+## Install
+
+`install.sh` sets up everything a DJ app needs, with no systemd editing:
+
+```
+cd ns7ii && cargo build --release && cd ..
+sudo ./install.sh ns7ii/target/release/ns7iid     # or a pre-built dist/ns7iid-$(uname -m)
+```
+
+It installs `/usr/local/bin/ns7iid`, the udev rule (the service starts when
+the NS7II is plugged in and exits when it is unplugged), the
+`ns7iid.service` unit with its `/usr/local/libexec/ns7iid-start` helper,
+`/etc/modules-load.d/ns7ii.conf` and `/etc/modprobe.d/ns7ii-aloop.conf`
+(the `snd-aloop` card, loaded at boot with the id `Loopback`, never card 0),
+and `/etc/default/ns7iid` (only if absent; your edits survive reinstalls).
+Running it again updates everything in place.
+
+The service bridges audio by default: the NS7II's 4 outputs and 12 inputs
+appear on the other end of the loopback. In the DJ app choose
+
+| | |
+|---|---|
+| audio output and input | `plughw:CARD=Loopback,DEV=0` (ALSA) |
+| MIDI controller | "Numark NS7II MIDI 1" |
+
+`plughw:` lets the app use any format, channel count and rate. Raw
+`hw:CARD=Loopback,DEV=0` works only if the app opens exactly 4 ch (12 ch for
+input) S24_3LE at 44100 Hz; anything else is converted on ns7iid's side, and
+when even that fails ns7iid logs why once per second and keeps retrying.
+
+Check it:
+
+```
+systemctl status ns7iid
+journalctl -u ns7iid -f            # "playback bridge: reading plughw:CARD=Loopback,DEV=1,SUBDEV=0 ..."
+aplay -D plughw:CARD=Loopback,DEV=0 -r 44100 -c 2 some.wav   # plays from the NS7II master out
+```
+
+Settings live in `/etc/default/ns7iid` (`NS7IID_AUDIO=0` for MIDI only,
+`NS7IID_PCM_OUT` / `NS7IID_PCM_IN`, extra `NS7IID_ARGS`); apply them with
+`sudo systemctl restart ns7iid`. `sudo ./install.sh --uninstall` removes
+everything the installer added (an edited `/etc/default/ns7iid` is kept);
+`snd-aloop` stays loaded until reboot or `sudo modprobe -r snd-aloop`.
 
 ## Mixxx mapping
 
