@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub mod midi;
+pub mod midi_out;
 pub mod pcm;
 pub mod requests;
 
