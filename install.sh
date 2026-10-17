@@ -1,8 +1,9 @@
 #!/bin/sh
-# Install the ns7iid driver: binary, udev rule, systemd service,
+# Install (or remove) the ns7iid driver: binary, udev rule, systemd service,
 # its start helper and settings, and the snd-aloop "Loopback" card that DJ
 # apps play into. Safe to run again (an update keeps /etc/default/ns7iid).
 # Usage: sudo ./install.sh [path/to/ns7iid-binary]   (default: dist/ns7iid-$(uname -m))
+#        sudo ./install.sh --uninstall
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -15,6 +16,23 @@ MODLOAD=/etc/modules-load.d/ns7ii.conf
 MODPROBE=/etc/modprobe.d/ns7ii-aloop.conf
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+
+if [ "$1" = --uninstall ]; then
+    systemctl stop ns7iid.service 2>/dev/null || true
+    rm -f "$UNIT" "$RULE" "$HELPER" "$BIN" "$MODLOAD" "$MODPROBE"
+    if [ -f "$DEFAULTS" ]; then
+        if cmp -s "$DEFAULTS" "$here/systemd/ns7iid.default"; then
+            rm -f "$DEFAULTS"
+        else
+            echo "kept $DEFAULTS (edited); remove it by hand if you no longer need it"
+        fi
+    fi
+    systemctl daemon-reload
+    udevadm control --reload
+    echo "uninstalled. The snd-aloop module stays loaded until reboot"
+    echo "(or: sudo modprobe -r snd-aloop, once no app uses the Loopback card)."
+    exit 0
+fi
 
 bin=${1:-"$here/dist/ns7iid-$(uname -m)"}
 [ -f "$bin" ] || { echo "no binary at $bin"; exit 1; }
@@ -52,3 +70,4 @@ echo "  systemctl status ns7iid     # is it running?"
 echo "  journalctl -u ns7iid -f     # its log"
 echo "Settings (NS7IID_AUDIO=0 for MIDI only): $DEFAULTS, then: systemctl restart ns7iid"
 echo "To run it by hand instead: systemctl stop ns7iid && ns7iid run"
+echo "Remove everything: sudo $here/install.sh --uninstall"
