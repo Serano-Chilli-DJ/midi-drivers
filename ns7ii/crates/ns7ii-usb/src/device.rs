@@ -1,6 +1,7 @@
 //! The NS7II as a device: endpoint plan, handshake, and stream factories.
 
 use crate::descriptors::{Endpoint, EndpointKind, Topology};
+use crate::feedback::{self, FramePattern};
 use crate::reactor::{next_token, Action, Reactor, StreamId, UrbHandler};
 use crate::sysfs::SysfsDevice;
 use crate::usbfs::{urb_flags, urb_type, Speed, Urb, UsbfsDevice};
@@ -9,7 +10,7 @@ use ns7ii_proto::requests::{self, ControlRequest, FirmwareInfo, RequestData};
 use ns7ii_proto::{classes, PRODUCT_ID, VENDOR_ID};
 use std::collections::VecDeque;
 use std::io;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -459,19 +460,24 @@ impl Ns7ii {
         self.plan.midi_out.as_ref().map(|e| e.address)
     }
 
-    /// Start an isochronous OUT stream fed by `source`.
-    pub fn start_iso_out(&self, ep: &Endpoint, cfg: IsoOutConfig, source: AudioSource) -> Result<IsoOutStream> {
-        let high_speed = self.high_speed();
-        let pacer = Pacer::new(cfg.rate, high_speed, cfg.frame_bytes, ep.max_packet * ep.packets_per_microframe as usize);
-        let mut list = Vec::new();
+    /// A frame pattern for this device's speed at `rate`, to share between
+    /// [`Ns7ii::start_feedback`] and [`Ns7ii::start_iso_out`].
+    pub fn frame_pattern(&self, rate: u32) -> SharedPattern {
+        Arc::new(Mutex::new(FramePattern::new(rate, self.high_speed())))
+    }
+
+    /// Start an isochronous OUT stream fed by `source`, sizing each packet
+    /// from `pattern` (the unit's feedback, or the nominal rate without it).
+    pub fn start_iso_out(&self, ep: &Endpoint, cfg: IsoOutConfig, source: AudioSource, pattern: SharedPattern) -> Result<IsoOutStream> {
         let max_packet = ep.max_packet * ep.packets_per_microframe as usize;
+        let mut list = Vec::new();
         for _ in 0..cfg.urbs.max(2) {
             let mut u = Urb::new(urb_type::ISO, ep.address, max_packet * cfg.packets_per_urb, cfg.packets_per_urb, next_token());
             u.set_flags(urb_flags::ISO_ASAP);
             list.push(u);
         }
         let stats = Arc::new(Mutex::new(IsoStats::default()));
-        let mut handler = IsoOutHandler { pacer, source, stats: Arc::clone(&stats), frame_bytes: cfg.frame_bytes };
+        let mut handler = IsoOutHandler { pattern, source, stats: Arc::clone(&stats), frame_bytes: cfg.frame_bytes, max_packet };
         for u in list.iter_mut() {
             handler.fill(u);
         }
@@ -479,12 +485,13 @@ impl Ns7ii {
         Ok(IsoOutStream { id, stats })
     }
 
-    /// Start reading the isochronous feedback endpoint; values are logged and
-    /// forwarded to `pacer_tx` as frames-per-(micro)frame in 16.16 fixed point.
-    pub fn start_feedback(&self, ep: &Endpoint, tx: Sender<u32>) -> Result<StreamId> {
-        let packets = 8;
+    /// Start reading the isochronous feedback endpoint into `pattern` (see
+    /// [`crate::feedback`]). The first packet, locking and lost sync are logged.
+    pub fn start_feedback(&self, ep: &Endpoint, pattern: SharedPattern) -> Result<StreamId> {
+        // One packet per service interval (1 ms); 4 ms per URB, as the kext does.
+        let packets = 4;
         let mut list = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let mut u = Urb::new(urb_type::ISO, ep.address, ep.max_packet * packets, packets, next_token());
             u.set_flags(urb_flags::ISO_ASAP);
             if let Some(p) = u.iso_packets_mut() {
@@ -494,10 +501,13 @@ impl Ns7ii {
             }
             list.push(u);
         }
-        let hs = self.high_speed();
-        Ok(self.reactor.add_stream(list, Box::new(FeedbackHandler { tx, max_packet: ep.max_packet, high_speed: hs }))?)
+        let handler = FeedbackHandler { pattern, max_packet: ep.max_packet, logged_first: false, lost: 0 };
+        Ok(self.reactor.add_stream(list, Box::new(handler))?)
     }
 }
+
+/// The frame pattern shared by a feedback stream and an OUT stream.
+pub type SharedPattern = Arc<Mutex<FramePattern>>;
 
 impl Drop for Ns7ii {
     fn drop(&mut self) {
@@ -670,8 +680,8 @@ pub struct IsoStats {
     pub packet_errors: u64,
     /// Bytes of silence inserted because the source ran dry.
     pub underrun_bytes: u64,
-    /// Current frames-per-packet estimate in 16.16.
-    pub frames_per_packet_fp: u32,
+    /// Frames sent (audio or silence).
+    pub frames: u64,
 }
 
 /// A running isochronous OUT stream.
@@ -682,65 +692,12 @@ pub struct IsoOutStream {
     pub stats: Arc<Mutex<IsoStats>>,
 }
 
-/// Decides how many frames go into each isochronous packet, like
-/// `snd-usb-audio`'s `freqn`/`freqm` accumulator, with exact rational
-/// arithmetic for the nominal rate. Accepts feedback updates (frames per
-/// (micro)frame in 16.16 fixed point).
-pub struct Pacer {
-    /// Frames per second, scaled by 65536 (so feedback values map exactly).
-    nominal_scaled: u64,
-    current_scaled: u64,
-    /// Packets per second times 65536.
-    denom: u64,
-    accum: u64,
-    per_sec: u64,
-    frame_bytes: usize,
-    max_packet: usize,
-}
-
-impl Pacer {
-    /// `rate` Hz, `high_speed` selects 8000 vs 1000 packets per second.
-    pub fn new(rate: u32, high_speed: bool, frame_bytes: usize, max_packet: usize) -> Self {
-        let per_sec = if high_speed { 8000u64 } else { 1000u64 };
-        let scaled = (rate as u64) << 16;
-        Self {
-            nominal_scaled: scaled,
-            current_scaled: scaled,
-            denom: per_sec << 16,
-            accum: 0,
-            per_sec,
-            frame_bytes,
-            max_packet,
-        }
-    }
-    /// Apply a feedback value (16.16 frames per (micro)frame). Values more
-    /// than 1 % away from nominal are ignored as garbage.
-    pub fn feedback(&mut self, fp: u32) {
-        let scaled = fp as u64 * self.per_sec;
-        let lo = self.nominal_scaled - self.nominal_scaled / 100;
-        let hi = self.nominal_scaled + self.nominal_scaled / 100;
-        if (lo..=hi).contains(&scaled) {
-            self.current_scaled = scaled;
-        }
-    }
-    /// Bytes to put in the next packet.
-    pub fn next_packet_bytes(&mut self) -> usize {
-        self.accum += self.current_scaled;
-        let frames = (self.accum / self.denom) as usize;
-        self.accum %= self.denom;
-        (frames * self.frame_bytes).min(self.max_packet)
-    }
-    /// Current estimate in 16.16 frames per packet.
-    pub fn current(&self) -> u32 {
-        (self.current_scaled / self.per_sec) as u32
-    }
-}
-
 struct IsoOutHandler {
-    pacer: Pacer,
+    pattern: SharedPattern,
     source: AudioSource,
     stats: Arc<Mutex<IsoStats>>,
     frame_bytes: usize,
+    max_packet: usize,
 }
 
 impl IsoOutHandler {
@@ -748,10 +705,13 @@ impl IsoOutHandler {
         let n_packets = urb.iso_packets().len();
         let mut lengths = Vec::with_capacity(n_packets);
         let mut total = 0usize;
-        for _ in 0..n_packets {
-            let l = self.pacer.next_packet_bytes();
-            lengths.push(l);
-            total += l;
+        {
+            let mut p = self.pattern.lock().unwrap();
+            for _ in 0..n_packets {
+                let l = (p.next_frames() * self.frame_bytes).min(self.max_packet);
+                lengths.push(l);
+                total += l;
+            }
         }
         let mut underrun = 0usize;
         {
@@ -773,16 +733,18 @@ impl IsoOutHandler {
         urb.set_length(total);
         let mut s = self.stats.lock().unwrap();
         s.underrun_bytes += underrun as u64;
-        s.frames_per_packet_fp = self.pacer.current();
-        let _ = self.frame_bytes;
+        s.frames += (total / self.frame_bytes.max(1)) as u64;
     }
 }
 
 impl UrbHandler for IsoOutHandler {
     fn complete(&mut self, urb: &mut Urb) -> Action {
         let st = urb.status();
-        if st == -libc::ENODEV || st == -libc::ESHUTDOWN {
+        if st == -libc::ENODEV {
             return Action::Park;
+        }
+        if st == -libc::ESHUTDOWN {
+            return Action::Fail("playback stream shut down by the host controller");
         }
         {
             let mut s = self.stats.lock().unwrap();
@@ -795,39 +757,50 @@ impl UrbHandler for IsoOutHandler {
 }
 
 struct FeedbackHandler {
-    tx: Sender<u32>,
+    pattern: SharedPattern,
     max_packet: usize,
-    high_speed: bool,
+    logged_first: bool,
+    lost: u64,
 }
 
 impl UrbHandler for FeedbackHandler {
     fn complete(&mut self, urb: &mut Urb) -> Action {
         let st = urb.status();
-        if st == -libc::ENODEV || st == -libc::ESHUTDOWN {
+        if st == -libc::ENODEV {
             return Action::Park;
+        }
+        if st == -libc::ESHUTDOWN {
+            return Action::Fail("feedback stream shut down by the host controller");
         }
         let descs: Vec<_> = urb.iso_packets().to_vec();
         let buf = urb.buffer();
         let mut off = 0usize;
+        let mut p = self.pattern.lock().unwrap();
         for d in &descs {
-            let n = d.actual_length as usize;
-            if d.status == 0 && n >= 3 {
+            let n = (d.actual_length as usize).min(self.max_packet);
+            if d.status == 0 && n > 0 {
                 let raw = &buf[off..off + n];
-                // UAC: full speed 3 bytes 10.14 (frames per ms); high speed 4 bytes 16.16
-                // (frames per microframe). Some firmware sends 3 bytes at high speed too.
-                let fp = if n >= 4 {
-                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
-                } else {
-                    let v = u32::from_le_bytes([raw[0], raw[1], raw[2], 0]);
-                    if self.high_speed { v >> 2 } else { v << 2 }
-                };
-                debug!("feedback raw {:02x?} -> {}.{:04x}", raw, fp >> 16, fp & 0xFFFF);
-                if self.tx.send(fp).is_err() {
-                    return Action::Park;
+                if !self.logged_first {
+                    self.logged_first = true;
+                    info!("feedback EP {:02x}: first packet {raw:02x?} ({n} bytes; byte 0 = frames played in that ms)", urb.endpoint());
+                }
+                match p.feedback(raw) {
+                    feedback::Event::Locked => info!(
+                        "feedback locked: playback follows the NS7II's clock ({} frames/ms)",
+                        p.stats().last_frames
+                    ),
+                    feedback::Event::LostSync => {
+                        self.lost += 1;
+                        if self.lost <= 3 || self.lost % 100 == 0 {
+                            warn!("feedback lost sync ({}x): packet {raw:02x?}; playing the nominal rate until it locks again", self.lost);
+                        }
+                    }
+                    _ => {}
                 }
             }
             off += self.max_packet;
         }
+        drop(p);
         if let Some(p) = urb.iso_packets_mut() {
             for d in p.iter_mut() {
                 d.length = self.max_packet as u32;
@@ -842,30 +815,6 @@ impl UrbHandler for FeedbackHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pacer_averages_to_rate_high_speed() {
-        let mut p = Pacer::new(44_100, true, 12, 1024);
-        let total: usize = (0..8000).map(|_| p.next_packet_bytes()).sum();
-        assert_eq!(total / 12, 44_100);
-    }
-
-    #[test]
-    fn pacer_averages_to_rate_full_speed() {
-        let mut p = Pacer::new(44_100, false, 12, 1023);
-        let total: usize = (0..1000).map(|_| p.next_packet_bytes()).sum();
-        assert_eq!(total / 12, 44_100);
-    }
-
-    #[test]
-    fn pacer_rejects_wild_feedback() {
-        let mut p = Pacer::new(48_000, true, 12, 1024);
-        let nominal = p.current();
-        p.feedback(nominal * 2);
-        assert_eq!(p.current(), nominal);
-        p.feedback(nominal + 100);
-        assert_eq!(p.current(), nominal + 100);
-    }
 
     #[test]
     fn bulk_statuses_map_to_recovery_actions() {

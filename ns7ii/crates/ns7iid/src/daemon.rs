@@ -20,15 +20,15 @@
 use crate::bridge;
 use crate::midi_out;
 use crate::Codec;
-use log::{debug, info, warn};
+use log::{info, warn};
 use ns7ii_proto::midi::strip_filler;
 use ns7ii_proto::pcm::{Plain24, WireCodec};
 use ns7ii_proto::requests::FirmwareInfo;
 use ns7ii_usb::descriptors::EndpointKind;
-use ns7ii_usb::device::{BulkStats, IsoStats};
+use ns7ii_usb::device::{BulkStats, IsoStats, SharedPattern};
 use ns7ii_usb::reactor::StreamId;
 use ns7ii_usb::sysfs::SysfsDevice;
-use ns7ii_usb::{AudioSource, IsoOutConfig, Ns7ii, Overrides};
+use ns7ii_usb::{AudioSource, Ns7ii, Overrides};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -48,6 +48,8 @@ const SHORT_SESSION: Duration = Duration::from_secs(30);
 const ISO_STALL: Duration = Duration::from_millis(1500);
 /// A capture stream that delivered before and then stops for this long is dead.
 const CAPTURE_STALL: Duration = Duration::from_secs(5);
+/// Interval of the status line in the journal.
+const STATUS_EVERY: Duration = Duration::from_secs(60);
 
 /// Settings of `ns7iid run`.
 pub struct Options {
@@ -111,7 +113,6 @@ struct Persistent {
     source: AudioSource,
     capture_tx: SyncSender<Vec<u8>>,
     midi_tx: Option<SyncSender<Vec<u8>>>,
-    feedback_tx: mpsc::Sender<u32>,
 }
 
 /// The streams of one session.
@@ -120,6 +121,7 @@ struct Session {
     ids: Vec<StreamId>,
     iso: Arc<Mutex<IsoStats>>,
     capture: Arc<Mutex<BulkStats>>,
+    pattern: SharedPattern,
     started: Instant,
 }
 
@@ -128,19 +130,15 @@ impl Session {
         let (in_ch, out_ch) = channels(fw);
         let codec = crate::make_codec(opts.codec, in_ch, out_ch);
         let mut ids = Vec::new();
+        let pattern = ns.frame_pattern(opts.rate);
         let result = (|| -> Result<(Arc<Mutex<IsoStats>>, Arc<Mutex<BulkStats>>), Box<dyn std::error::Error>> {
             // Audio first, as the vendor driver does: the unit services MIDI only while it streams.
             if let Some(fb) = &ns.plan().feedback {
-                ids.push(ns.start_feedback(fb, p.feedback_tx.clone())?);
+                ids.push(ns.start_feedback(fb, Arc::clone(&pattern))?);
             }
             let ep = ns.plan().playback.clone().ok_or("no playback endpoint; pass --play-ep")?;
-            let cfg = IsoOutConfig {
-                rate: opts.rate,
-                frame_bytes: codec.out_frame_bytes(),
-                packets_per_urb: if ns.high_speed() { 16 } else { 4 },
-                urbs: 4,
-            };
-            let iso = ns.start_iso_out(&ep, cfg, p.source.clone())?;
+            let cfg = crate::iso_config(&ns, opts.rate, codec.out_frame_bytes());
+            let iso = ns.start_iso_out(&ep, cfg, p.source.clone(), Arc::clone(&pattern))?;
             ids.push(iso.id);
             let cap_ep = ns.plan().capture.clone().ok_or("no capture endpoint; pass --capture-ep")?;
             let packets = if cap_ep.kind == EndpointKind::Interrupt { 8 } else { 16 };
@@ -153,7 +151,7 @@ impl Session {
             Ok((iso.stats, cap_stats))
         })();
         match result {
-            Ok((iso, capture)) => Ok(Self { ns, ids, iso, capture, started: Instant::now() }),
+            Ok((iso, capture)) => Ok(Self { ns, ids, iso, capture, pattern, started: Instant::now() }),
             Err(e) => {
                 for id in ids.iter().rev() {
                     ns.stop(*id);
@@ -164,15 +162,14 @@ impl Session {
     }
 
     /// Watch the session until it ends.
-    fn monitor(&self, stop: &AtomicBool, midi: &midi_out::Shared, feedback: &Receiver<u32>) -> End {
+    fn monitor(&self, stop: &AtomicBool, midi: &midi_out::Shared) -> End {
         let mut iso_seen = (0u64, Instant::now());
         let mut cap_seen = (0u64, Instant::now());
         let mut cap_flowing = false;
+        let mut feedback_checked = false;
+        let mut last_status = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(100));
-            while let Ok(fp) = feedback.try_recv() {
-                debug!("feedback {}.{:04x}", fp >> 16, fp & 0xFFFF);
-            }
             if stop.load(Ordering::SeqCst) {
                 return End::Stop;
             }
@@ -190,6 +187,36 @@ impl Session {
                 return End::Fault(why);
             }
             let now = Instant::now();
+            let fb = self.pattern.lock().unwrap().stats();
+            if !feedback_checked && now - self.started >= Duration::from_secs(2) {
+                feedback_checked = true;
+                if self.ns.plan().feedback.is_some() && fb.good == 0 {
+                    warn!(
+                        "no usable feedback from the NS7II after 2 s ({} packets, {} out of range): playback runs at the nominal \
+                         rate on the host's clock and may click as the unit's clock drifts",
+                        fb.packets, fb.out_of_range
+                    );
+                }
+            }
+            if now - last_status >= STATUS_EVERY {
+                last_status = now;
+                let iso = *self.iso.lock().unwrap();
+                let cap = *self.capture.lock().unwrap();
+                info!(
+                    "status: playback {} frames, {} packet errors | feedback {} ({} frames/ms, {} out of range, {} bad length; {} packets paced from feedback, {} nominal) | capture {} B, {} errors, {} dropped",
+                    iso.frames,
+                    iso.packet_errors,
+                    if fb.locked { "locked" } else { "NOT locked" },
+                    fb.last_frames,
+                    fb.out_of_range,
+                    fb.bad_length,
+                    fb.from_feedback,
+                    fb.from_nominal,
+                    cap.bytes,
+                    cap.errors,
+                    cap.dropped
+                );
+            }
             let urbs = self.iso.lock().unwrap().urbs;
             if urbs != iso_seen.0 {
                 iso_seen = (urbs, now);
@@ -291,7 +318,6 @@ pub fn run(opts: Options, stop: Arc<AtomicBool>) -> Result<i32, Box<dyn std::err
     let mut threads = Vec::new();
 
     let (capture_tx, capture_rx) = mpsc::sync_channel(ns7ii_usb::device::BULK_IN_QUEUE);
-    let (feedback_tx, feedback_rx) = mpsc::channel();
     let mut midi_tx = None;
 
     // MIDI: one sequencer port for the whole process, so apps stay connected
@@ -342,7 +368,7 @@ pub fn run(opts: Options, stop: Arc<AtomicBool>) -> Result<i32, Box<dyn std::err
     let source = AudioSource::new();
     threads.push(spawn_playback(&opts, &alsa, out_ch, source.clone(), Arc::clone(&stop)));
     threads.push(spawn_capture(&opts, &alsa, in_ch, out_ch, capture_rx, Arc::clone(&stop)));
-    let persistent = Persistent { source, capture_tx, midi_tx, feedback_tx };
+    let persistent = Persistent { source, capture_tx, midi_tx };
 
     println!("running; Ctrl-C to stop");
     let mut policy = Policy::default();
@@ -358,7 +384,7 @@ pub fn run(opts: Options, stop: Arc<AtomicBool>) -> Result<i32, Box<dyn std::err
                 drop(ns);
                 let _ = midi.take_fault();
                 slot.set(Some(Arc::clone(&session.ns)));
-                let end = session.monitor(&stop, &midi, &feedback_rx);
+                let end = session.monitor(&stop, &midi);
                 slot.set(None);
                 let lived = session.started.elapsed();
                 let info = session.ns.info().clone();

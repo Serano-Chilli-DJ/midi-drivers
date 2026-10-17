@@ -11,6 +11,7 @@
 
 pub mod descriptors;
 pub mod device;
+pub mod feedback;
 pub mod reactor;
 pub mod sysfs;
 pub mod usbfs;

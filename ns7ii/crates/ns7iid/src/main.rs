@@ -274,6 +274,13 @@ fn open(cli: &Cli) -> Result<Ns7ii, Box<dyn std::error::Error>> {
     Ok(ns)
 }
 
+/// URB layout of the playback stream: like the vendor driver, 4 ms per URB
+/// (32 microframes at high speed), with 4 URBs = 16 ms in flight so a busy
+/// desktop delaying the reactor thread does not starve the unit.
+fn iso_config(ns: &Ns7ii, rate: u32, frame_bytes: usize) -> IsoOutConfig {
+    IsoOutConfig { rate, frame_bytes, packets_per_urb: if ns.high_speed() { 32 } else { 4 }, urbs: 4 }
+}
+
 fn make_codec(codec: Codec, in_ch: usize, out_ch: usize) -> Box<dyn WireCodec + Send> {
     match codec {
         Codec::Plain24 => Box::new(Plain24 { out_channels: out_ch, in_channels: in_ch }),
@@ -344,16 +351,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let codec = make_codec(cli.codec, in_ch, out_ch);
                 let play_ep = ns.plan().playback.clone().ok_or("no playback endpoint")?;
                 let cap_ep = ns.plan().capture.clone().ok_or("no capture endpoint")?;
-                let (fb_tx, fb_rx) = mpsc::channel();
+                let pattern = ns.frame_pattern(cli.rate);
                 let fb_id = match &ns.plan().feedback {
-                    Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+                    Some(fb) => Some(ns.start_feedback(fb, Arc::clone(&pattern))?),
                     None => None,
                 };
-                let cfg = IsoOutConfig { rate: cli.rate, frame_bytes: codec.out_frame_bytes(), packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
-                let iso = ns.start_iso_out(&play_ep, cfg, AudioSource::new())?;
+                let iso = ns.start_iso_out(&play_ep, iso_config(&ns, cli.rate, codec.out_frame_bytes()), AudioSource::new(), Arc::clone(&pattern))?;
                 let cap = ns.start_bulk_in(&cap_ep, 4, 16)?;
                 println!("audio streams running: silence -> EP {:02x}, capture from EP {:02x} (discarded)", play_ep.address, cap_ep.address);
-                audio = Some((iso, cap, fb_rx, fb_id));
+                audio = Some((iso, cap, pattern, fb_id));
             }
             let stream = ns.start_bulk_in(&ep, 4, 1)?;
             let stop = ctrl_c_flag();
@@ -361,8 +367,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut clean = Vec::new();
             let mut last = Instant::now();
             let mut cap_bytes = 0u64;
-            let mut fb_seen = 0u64;
-            let mut fb_last = 0u32;
             let mut filler_only = 0u64;
             while !stop.load(Ordering::SeqCst) {
                 match stream.rx.recv_timeout(Duration::from_millis(50)) {
@@ -385,24 +389,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                if let Some((iso, cap, fb_rx, _)) = &audio {
+                if let Some((iso, cap, pattern, _)) = &audio {
                     while let Ok(b) = cap.rx.try_recv() {
                         cap_bytes += b.len() as u64;
                     }
-                    while let Ok(fp) = fb_rx.try_recv() {
-                        fb_seen += 1;
-                        fb_last = fp;
-                    }
+                    let fb = pattern.lock().unwrap().stats();
                     if last.elapsed() >= Duration::from_secs(2) {
                         let s = *iso.stats.lock().unwrap();
                         let cs = *cap.stats.lock().unwrap();
                         let ms = *stream.stats.lock().unwrap();
                         println!(
-                            "stats: play urbs {} pkt-err {} | capture {} B ({} B/s) compl {} err {} last {} | midi compl {} err {} last {} filler-only {} | feedback pkts {} last {}.{:04x}",
+                            "stats: play urbs {} pkt-err {} | capture {} B ({} B/s) compl {} err {} last {} | midi compl {} err {} last {} filler-only {} | feedback pkts {} last {} frames/ms locked {}",
                             s.urbs, s.packet_errors,
                             cap_bytes, cap_bytes / last.elapsed().as_secs().max(1), cs.completions, cs.errors, cs.last_error,
                             ms.completions, ms.errors, ms.last_error, filler_only,
-                            fb_seen, fb_last >> 16, fb_last & 0xFFFF
+                            fb.packets, fb.last_frames, fb.locked
                         );
                         cap_bytes = 0;
                         last = Instant::now();
@@ -578,26 +579,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let n = codec.encode(&frames, &mut wire);
             source.push(&wire[..n]);
             let total_frames = frames.len() / out_ch;
-            let cfg = IsoOutConfig { rate: cli.rate, frame_bytes, packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
-            let (fb_tx, fb_rx) = mpsc::channel();
+            let pattern = ns.frame_pattern(cli.rate);
             let fb_id = match &ns.plan().feedback {
-                Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+                Some(fb) => Some(ns.start_feedback(fb, Arc::clone(&pattern))?),
                 None => None,
             };
-            let stream = ns.start_iso_out(&ep, cfg, source.clone())?;
+            let stream = ns.start_iso_out(&ep, iso_config(&ns, cli.rate, frame_bytes), source.clone(), Arc::clone(&pattern))?;
             println!("playing {total_frames} frames ({out_ch} ch) to EP {:02x} ...", ep.address);
             let stop = ctrl_c_flag();
             let mut last = Instant::now();
             while !stop.load(Ordering::SeqCst) && source.queued() > 0 {
                 std::thread::sleep(Duration::from_millis(50));
-                while let Ok(fp) = fb_rx.try_recv() {
-                    info!("feedback {}.{:04x} frames/packet", fp >> 16, fp & 0xFFFF);
-                }
                 if last.elapsed() > Duration::from_secs(1) {
                     let s = *stream.stats.lock().unwrap();
+                    let fb = pattern.lock().unwrap().stats();
                     println!(
-                        "urbs {} pkt errors {} underrun {} B  queued {} B",
-                        s.urbs, s.packet_errors, s.underrun_bytes, source.queued()
+                        "urbs {} pkt errors {} underrun {} B  queued {} B | feedback {} pkts, last {} frames/ms, locked {}, {} out of range, {} bad length",
+                        s.urbs, s.packet_errors, s.underrun_bytes, source.queued(), fb.packets, fb.last_frames, fb.locked, fb.out_of_range, fb.bad_length
                     );
                     last = Instant::now();
                 }
@@ -683,13 +681,12 @@ impl AudioBackground {
         let codec = make_codec(codec, in_ch, out_ch);
         let play_ep = ns.plan().playback.clone().ok_or("no playback endpoint")?;
         let cap_ep = ns.plan().capture.clone().ok_or("no capture endpoint")?;
-        let (fb_tx, fb_rx) = mpsc::channel();
+        let pattern = ns.frame_pattern(rate);
         let fb_id = match &ns.plan().feedback {
-            Some(fb) => Some(ns.start_feedback(fb, fb_tx)?),
+            Some(fb) => Some(ns.start_feedback(fb, Arc::clone(&pattern))?),
             None => None,
         };
-        let cfg = IsoOutConfig { rate, frame_bytes: codec.out_frame_bytes(), packets_per_urb: if ns.high_speed() { 16 } else { 4 }, urbs: 4 };
-        let iso = ns.start_iso_out(&play_ep, cfg, AudioSource::new())?;
+        let iso = ns.start_iso_out(&play_ep, iso_config(ns, rate, codec.out_frame_bytes()), AudioSource::new(), pattern)?;
         let cap = ns.start_bulk_in(&cap_ep, 4, 16)?;
         let cap_id = cap.id;
         let stop = Arc::new(AtomicBool::new(false));
@@ -697,7 +694,6 @@ impl AudioBackground {
         let drain = std::thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
                 let _ = cap.rx.recv_timeout(Duration::from_millis(50));
-                while fb_rx.try_recv().is_ok() {}
             }
         });
         Ok(Self { iso, cap_id, fb_id, drain: Some(drain), stop })
