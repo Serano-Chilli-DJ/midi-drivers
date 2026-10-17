@@ -1,0 +1,19 @@
+# Settings for the ns7iid service. Installed as /etc/default/ns7iid by
+# install.sh, which never overwrites an existing copy.
+# After editing: sudo systemctl restart ns7iid
+
+# 1 bridges audio through the snd-aloop "Loopback" card; 0 runs MIDI only.
+NS7IID_AUDIO=1
+
+# Loopback ends the daemon uses. Apps play into and record from the other
+# end, plughw:CARD=Loopback,DEV=0 (subdevice 0). ns7iid's side runs at
+# 44100 Hz S24_3LE, 4 channels out / 12 in; plughw: converts from whatever
+# the app chose. With hw: here, an app that opens the loopback in another
+# format makes snd-aloop fail ns7iid's side with EIO.
+NS7IID_PCM_OUT=plughw:CARD=Loopback,DEV=1,SUBDEV=0
+NS7IID_PCM_IN=plughw:CARD=Loopback,DEV=1,SUBDEV=0
+
+# Extra arguments for `ns7iid run` (e.g. --codec junction).
+NS7IID_ARGS=
+
+RUST_LOG=info

@@ -1,22 +1,54 @@
 #!/bin/sh
-# Install a pre-built ns7iid binary, the udev rule, the systemd service and the
-# snd-aloop Loopback card configuration. Run with sudo.
+# Install the ns7iid driver: binary, udev rule, systemd service,
+# its start helper and settings, and the snd-aloop "Loopback" card that DJ
+# apps play into. Safe to run again (an update keeps /etc/default/ns7iid).
 # Usage: sudo ./install.sh [path/to/ns7iid-binary]   (default: dist/ns7iid-$(uname -m))
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
+
+BIN=/usr/local/bin/ns7iid
+HELPER=/usr/local/libexec/ns7iid-start
+UNIT=/etc/systemd/system/ns7iid.service
+RULE=/etc/udev/rules.d/99-numark-ns7ii.rules
+DEFAULTS=/etc/default/ns7iid
+MODLOAD=/etc/modules-load.d/ns7ii.conf
+MODPROBE=/etc/modprobe.d/ns7ii-aloop.conf
+
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+
 bin=${1:-"$here/dist/ns7iid-$(uname -m)"}
 [ -f "$bin" ] || { echo "no binary at $bin"; exit 1; }
 systemctl stop ns7iid.service 2>/dev/null || true
-install -m755 "$bin" /usr/local/bin/ns7iid
-install -m644 "$here/udev/99-numark-ns7ii.rules" /etc/udev/rules.d/
-install -m644 "$here/systemd/ns7iid.service" /etc/systemd/system/
-# The ALSA loopback card apps play into: loaded at every boot, card id "Loopback".
-install -D -m644 "$here/modules/ns7ii-modules-load.conf" /etc/modules-load.d/ns7ii.conf
-install -D -m644 "$here/modules/ns7ii-aloop.conf" /etc/modprobe.d/ns7ii-aloop.conf
+install -m755 "$bin" "$BIN"
+install -D -m755 "$here/systemd/ns7iid-start" "$HELPER"
+install -m644 "$here/udev/99-numark-ns7ii.rules" "$RULE"
+install -m644 "$here/systemd/ns7iid.service" "$UNIT"
+install -D -m644 "$here/modules/ns7ii-modules-load.conf" "$MODLOAD"
+install -D -m644 "$here/modules/ns7ii-aloop.conf" "$MODPROBE"
+if [ -e "$DEFAULTS" ]; then
+    echo "keeping existing $DEFAULTS (new template: $here/systemd/ns7iid.default)"
+else
+    install -D -m644 "$here/systemd/ns7iid.default" "$DEFAULTS"
+fi
+# Load the loopback card now (at boot, modules-load.d does it). A copy loaded
+# earlier without these options keeps its old card index until it is reloaded.
+if [ ! -e /proc/asound/Loopback ]; then
+    modprobe snd-aloop || echo "warning: could not load snd-aloop; audio bridging stays off until it loads"
+fi
 systemctl daemon-reload
 udevadm control --reload && udevadm trigger --subsystem-match=usb --attr-match=idVendor=15e4
-if ! lsmod | grep -q '^snd_aloop'; then modprobe snd-aloop 2>/dev/null || true; fi
-echo "installed. The driver now starts automatically when the NS7II is plugged in:"
+# Start (or restart, after the stop above) the service if the NS7II is plugged in now.
+for d in /sys/bus/usb/devices/*; do
+    if [ "$(cat "$d/idVendor" 2>/dev/null)" = 15e4 ] && [ "$(cat "$d/idProduct" 2>/dev/null)" = 002c ]; then
+        systemctl start --no-block ns7iid.service
+    fi
+done
+
+echo "installed. The driver starts automatically when the NS7II is plugged in,"
+echo "bridging audio to the ALSA card 'Loopback'. Point the DJ app at"
+echo "  plughw:CARD=Loopback,DEV=0   (output and input)"
+echo "and the 'Numark NS7II' MIDI port."
 echo "  systemctl status ns7iid     # is it running?"
 echo "  journalctl -u ns7iid -f     # its log"
+echo "Settings (NS7IID_AUDIO=0 for MIDI only): $DEFAULTS, then: systemctl restart ns7iid"
 echo "To run it by hand instead: systemctl stop ns7iid && ns7iid run"

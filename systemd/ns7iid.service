@@ -1,21 +1,25 @@
 [Unit]
 Description=Numark NS7II user-space driver (MIDI + audio bridge)
 # Started by the udev rule in udev/99-numark-ns7ii.rules when the device appears.
-After=sound.target
+# The ALSA loopback card is loaded at boot by /etc/modules-load.d/ns7ii.conf;
+# ns7iid-start also loads it and waits for /proc/asound/Loopback.
+After=sound.target systemd-modules-load.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
-# Add --pcm-out/--pcm-in here once audio bridging is verified, e.g.
-#   --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,1
-ExecStart=/usr/local/bin/ns7iid run
 Environment=RUST_LOG=info
+# NS7IID_AUDIO (0 = MIDI only), NS7IID_PCM_OUT, NS7IID_PCM_IN, NS7IID_ARGS.
+EnvironmentFile=-/etc/default/ns7iid
+ExecStart=/usr/local/libexec/ns7iid-start
 # The daemon exits on unplug; udev starts a fresh instance on the next plug-in.
 Restart=on-failure
 RestartSec=3
-# Hardening. No device allow-list: it needs /dev/bus/usb and /dev/snd, and
-# systemd's DevicePolicy/DeviceAllow denied /dev/snd/seq on a test machine.
+# Hardening. No device allow-list: it needs /dev/bus/usb and /dev/snd
+# (seq, and the loopback's pcmC*D*), and systemd's DevicePolicy/DeviceAllow
+# denied /dev/snd/seq on a test machine. No ProtectKernelModules:
+# ns7iid-start may modprobe snd-aloop.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

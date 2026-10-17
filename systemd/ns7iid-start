@@ -1,0 +1,30 @@
+#!/bin/sh
+# Start `ns7iid run` for the systemd service, with audio bridging unless
+# NS7IID_AUDIO=0. Settings come from /etc/default/ns7iid (see ns7iid.default).
+# Installed as /usr/local/libexec/ns7iid-start by install.sh.
+bin=${NS7IID_BIN:-/usr/local/bin/ns7iid}
+audio=${NS7IID_AUDIO:-1}
+pcm_out=${NS7IID_PCM_OUT:-plughw:CARD=Loopback,DEV=1,SUBDEV=0}
+pcm_in=${NS7IID_PCM_IN:-plughw:CARD=Loopback,DEV=1,SUBDEV=0}
+
+if [ "$audio" = 0 ]; then
+    echo "ns7iid-start: NS7IID_AUDIO=0, MIDI only"
+    # shellcheck disable=SC2086  # NS7IID_ARGS is a word list
+    exec "$bin" run $NS7IID_ARGS
+fi
+
+# The card normally exists already (modules-load.d); load it if not.
+[ -e /proc/asound/Loopback ] || modprobe snd-aloop 2>/dev/null || true
+i=0
+while [ ! -e /proc/asound/Loopback ] && [ $i -lt 100 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if [ ! -e /proc/asound/Loopback ]; then
+    echo "ns7iid-start: no ALSA card named Loopback (is snd-aloop installed? see /proc/asound/cards); running MIDI only" >&2
+    # shellcheck disable=SC2086
+    exec "$bin" run $NS7IID_ARGS
+fi
+echo "ns7iid-start: bridging audio: --pcm-out $pcm_out --pcm-in $pcm_in"
+# shellcheck disable=SC2086
+exec "$bin" run --pcm-out "$pcm_out" --pcm-in "$pcm_in" $NS7IID_ARGS
