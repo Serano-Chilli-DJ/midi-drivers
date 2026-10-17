@@ -9,6 +9,7 @@
 //! 4. `record`: capture audio to a WAV file; `play`: play a WAV or test tone.
 //! 5. `run`: the daemon — ALSA sequencer MIDI ports plus PCM bridging.
 
+mod bridge;
 mod chart;
 mod learn;
 mod mixxx;
@@ -703,9 +704,9 @@ fn run_daemon(
         let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
         let mut pcm = match &pcm_out {
             Some(name) => {
-                let p = alsa.open_pcm(name, true, out_ch as u32, cli.rate, 50_000)?;
                 info!("playback bridge: reading {name} as {out_ch} ch S24_3LE {} Hz; a loopback's other end must be opened with the same format (or through plughw:)", cli.rate);
-                Some(p)
+                let (alsa, name2, rate) = (alsa.clone(), name.clone(), cli.rate);
+                Some(bridge::Bridge::start("playback bridge", name, move || alsa.open_pcm(&name2, true, out_ch as u32, rate, 50_000), Instant::now()))
             }
             None => None,
         };
@@ -729,16 +730,15 @@ fn run_daemon(
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
                 }
-                match pcm.read(&mut in_bytes) {
-                    Ok(n) => {
+                match pcm.read(&mut in_bytes, Instant::now()) {
+                    Some(n) => {
                         let got = plain.decode(&in_bytes[..n], &mut samples);
                         let m = out_codec.encode(&samples[..got], &mut wire);
                         source.push(&wire[..m]);
                     }
-                    Err(e) => {
-                        warn!("pcm read: {e}");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
+                    // Failing or waiting to reopen (logged, rate-limited);
+                    // the device plays silence meanwhile.
+                    None => std::thread::sleep(Duration::from_millis(20)),
                 }
             }
             ns2.stop(stream.id);
@@ -753,9 +753,9 @@ fn run_daemon(
         let ep = ns.plan().capture.clone().ok_or("no capture endpoint; pass --capture-ep")?;
         let mut pcm = match &pcm_in {
             Some(name) => {
-                let p = alsa.open_pcm(name, false, in_ch as u32, cli.rate, 50_000)?;
                 info!("capture bridge: writing {name} as {in_ch} ch S24_3LE {} Hz; a loopback's other end must be opened with the same format (or through plughw:)", cli.rate);
-                Some(p)
+                let (alsa, name2, rate) = (alsa.clone(), name.clone(), cli.rate);
+                Some(bridge::Bridge::start("capture bridge", name, move || alsa.open_pcm(&name2, false, in_ch as u32, rate, 50_000), Instant::now()))
             }
             None => None,
         };
@@ -783,9 +783,8 @@ fn run_daemon(
                         let n_samples = if is_junction { n * in_ch } else { n };
                         out_bytes.resize(n_samples * 3, 0);
                         plain.encode(&samples[..n_samples], &mut out_bytes);
-                        if let Err(e) = pcm.write(&out_bytes) {
-                            warn!("pcm write: {e}");
-                        }
+                        // On error the block is dropped; the bridge logs and reopens.
+                        let _ = pcm.write(&out_bytes, Instant::now());
                         pending.drain(..usable);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
