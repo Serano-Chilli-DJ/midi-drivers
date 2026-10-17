@@ -4,8 +4,9 @@ Description=Numark NS7II user-space driver (MIDI + audio bridge)
 # The ALSA loopback card is loaded at boot by /etc/modules-load.d/ns7ii.conf;
 # ns7iid-start also loads it and waits for /proc/asound/Loopback.
 After=sound.target systemd-modules-load.service
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# No start rate limit: the daemon recovers USB faults itself and only exits
+# when the unit is gone (status 69, no restart) or keeps failing (restart).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,9 +14,14 @@ Environment=RUST_LOG=info
 # NS7IID_AUDIO (0 = MIDI only), NS7IID_PCM_OUT, NS7IID_PCM_IN, NS7IID_ARGS.
 EnvironmentFile=-/etc/default/ns7iid
 ExecStart=/usr/local/libexec/ns7iid-start
-# The daemon exits on unplug; udev starts a fresh instance on the next plug-in.
-Restart=on-failure
+# ns7iid rides out USB resets and re-enumeration in-process (the MIDI port
+# stays up). It exits 69 when the NS7II has left the bus for good: that counts
+# as success and is not restarted; udev starts a fresh instance on the next
+# plug-in. Any other exit (repeated faults, a panic, a crash) is restarted.
+Restart=always
 RestartSec=3
+SuccessExitStatus=69
+RestartPreventExitStatus=69
 # Hardening. No device allow-list: it needs /dev/bus/usb and /dev/snd
 # (seq, and the loopback's pcmC*D*), and systemd's DevicePolicy/DeviceAllow
 # denied /dev/snd/seq on a test machine. No ProtectKernelModules:
