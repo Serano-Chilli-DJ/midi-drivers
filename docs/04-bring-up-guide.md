@@ -145,6 +145,32 @@ loopback in a format ns7iid cannot convert to; switch the app to plughw.
   helper, udev rule and module config (and `/etc/default/ns7iid` unless
   edited); reboot or `sudo modprobe -r snd-aloop` to drop the card.
 
+### Audio quality, drift and recovery checks (need the hardware)
+
+These parts were built and unit-tested without a unit (simulated clocks,
+fake PCMs and a fake MIDI endpoint); confirm them on the NS7II:
+
+1. **Feedback format.** `journalctl -u ns7iid -b | grep -E "feedback"`
+   should show `first packet [2c ...]` or `[2d ...]` (44 or 45 frames,
+   3 bytes) and `feedback locked` within a second. Also run
+   `sudo systemctl stop ns7iid; ns7iid play --seconds 20` and check the
+   `feedback ... locked true, 0 out of range, 0 bad length` part of the
+   statistics line. Anything else: send the lines.
+2. **No drift clicks.** Play a steady sine for 30 minutes from the DJ app (or
+   `speaker-test -D plughw:CARD=Loopback,DEV=0 -c 2 -r 48000 -t sine -f 1000`)
+   and listen on Master OUT; the minute lines must show a settled
+   `clock correction` and `0 underruns`:
+   `journalctl -u ns7iid -f | grep -E "queue|underrun|overflowed"`.
+3. **Idle is quiet.** With no app playing, `journalctl -u ns7iid -f` shows
+   one `no app playing into the loopback` and nothing else.
+4. **MIDI OUT under load.** Run the DJ app with meters and pad colours for
+   an hour; `journalctl -u ns7iid -b | grep -c "MIDI OUT"` should stay near 0,
+   and `systemctl status ns7iid` should show memory staying around its
+   start-up value (a few MB, not hundreds).
+5. **Recovery.** `sudo usbreset 15e4:002c` (package `usbutils`) while the
+   app runs: the journal should show `left the USB bus`, `NS7II reopened and
+   handshaken`, `NS7II streaming`, and the app keeps its MIDI connection.
+
 ## Step 7: Mixxx mapping
 
 ```

@@ -83,10 +83,14 @@ appear on the other end of the loopback. In the DJ app choose
 | audio output and input | `plughw:CARD=Loopback,DEV=0` (ALSA) |
 | MIDI controller | "Numark NS7II MIDI 1" |
 
-`plughw:` lets the app use any format, channel count and rate. Raw
-`hw:CARD=Loopback,DEV=0` works only if the app opens exactly 4 ch (12 ch for
-input) S24_3LE at 44100 Hz; anything else is converted on ns7iid's side, and
-when even that fails ns7iid logs why once per second and keeps retrying.
+`plughw:` lets the app use any format, channel count and rate. For playback
+ns7iid opens its end of the loopback only once an app has opened the other
+end, takes the app's rate as it is and converts it to the NS7II's 44.1 kHz
+itself with a band-limited resampler that also absorbs the clock difference
+between the loopback (kernel timer) and the unit (its own crystal, followed
+through its feedback endpoint). While no app plays, the unit gets silence and
+the journal says so once. For capture, raw `hw:CARD=Loopback,DEV=0` works
+only if the app opens exactly 12 ch S24_3LE at 44100 Hz.
 
 Check it:
 
@@ -95,6 +99,33 @@ systemctl status ns7iid
 journalctl -u ns7iid -f            # "playback bridge: reading plughw:CARD=Loopback,DEV=1,SUBDEV=0 ..."
 aplay -D plughw:CARD=Loopback,DEV=0 -r 44100 -c 2 some.wav   # plays from the NS7II master out
 ```
+
+What the journal shows, and how to watch a problem:
+
+```
+journalctl -u ns7iid -b -o short-precise                 # this boot
+journalctl -u ns7iid -f | grep -E "status:|queue|underrun|feedback|MIDI OUT|fault|left the USB|reset|reopen"
+journalctl -u ns7iid -b | grep -cE "underrun|overflowed"  # audio dropouts since boot
+journalctl -u ns7iid -b | grep -E "fault|left the USB|reset|reopen|keeps failing|panic"   # USB recoveries
+```
+
+* `feedback EP 81: first packet [2c, ..]` and `feedback locked` at start-up:
+  playback follows the unit's clock. `no usable feedback` or `lost sync`:
+  send that line back.
+* `playback bridge: queue 20.1 ms (target 20 ms), clock correction +85 ppm,
+  0 underruns`: once a minute while an app plays. The correction is the
+  loopback-vs-NS7II clock difference (typically within ±300 ppm) and should
+  settle; underruns should stay 0. `playback underrun` lines name the queue
+  level when it happened.
+* `status: playback ... feedback locked ... capture ...`: once a minute per
+  USB session.
+* `MIDI OUT to the NS7II timed out`: the unit was busy; the writer slowed
+  down. Lower `--midi-out-rate` (in `NS7IID_ARGS`) if it repeats.
+* `... stream fault ...; resetting the NS7II's USB port` / `left the USB bus
+  ...; waiting up to 30 s`: ns7iid recovers by itself (the MIDI port stays,
+  apps stay connected). Exit status 69 means the unit stayed away; udev starts
+  the service again on the next plug-in. Any other exit is restarted by
+  systemd after 3 s.
 
 Settings live in `/etc/default/ns7iid` (`NS7IID_AUDIO=0` for MIDI only,
 `NS7IID_PCM_OUT` / `NS7IID_PCM_IN`, extra `NS7IID_ARGS`); apply them with
