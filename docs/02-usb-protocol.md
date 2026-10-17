@@ -36,9 +36,8 @@ Raw: `12 01 00 02 ff ff ff 40 e4 15 2c 00 00 02 01 02 03 01 09 02 50 00 02 01 00
 No class MIDI interface, so MIDI goes through the driver. 156 bytes per
 microframe is 13 frames of 4 channels x 3 bytes: the playback endpoint is
 sized for 4 channels of 24-bit at up to 96 kHz, which supports the plain
-24-bit 4-output conclusion below. The 64-byte isochronous IN endpoint is
-larger than a UAC feedback endpoint (3-4 bytes); its content is still to be
-captured (`RUST_LOG=debug` logs it).
+24-bit 4-output conclusion below. The 64-byte isochronous IN endpoint
+carries 3-byte feedback packets (see "Playback feedback" below).
 
 ## Control requests (endpoint 0)
 
@@ -79,14 +78,36 @@ reason to trust the device's own reply).
   `isPloytecBulkDevice` (Allen & Heath, Reloop, ESU...). The NS7II is not in
   that list. The driver still ships that codec behind `--codec junction` in
   case hardware proves otherwise.
-* Isochronous OUT packets carry whole frames; the host paces them at
-  rate / 8000 frames per microframe (high speed) or rate / 1000 per frame
-  (full speed) and corrects from the feedback endpoint (UAC-style 10.14 or
-  16.16 value) when one exists. **assumed**: the kext's `isocReadFeedback`
-  path exists for this family but the feedback format was not decoded.
+* Isochronous OUT packets carry whole frames, sized from the feedback
+  endpoint as described in "Playback feedback". **kext-decoded**
 * Bulk IN capture: a stream of frames with no header. **assumed** (default
   `pcmFrom24LSB`; the Xone's MIDI/control bytes are *not* interleaved on the
   Numark path because `isPloytecBulkDevice` is false).
+
+## Playback feedback (EP 0x81) **kext-decoded 2026-10-17, byte 0 to confirm on hardware**
+
+From the 3.3.17 kext (`isocReadFeedbackCompleteStatic` 0x1a6e6,
+`isocFeedbackReadCompleteFullFrame` 0x1afaa, `PGFramePatternObserver`,
+`PGIsocRB::initWrite_Std` 0x1b808, `rtsIsocAudioRun` 0x1796e):
+
+* Every 1 ms (bInterval 4 at high speed) the unit sends a **3-byte** packet.
+  **Byte 0 = frames the unit played in that millisecond** (42..46 at
+  44.1 kHz; the kext accepts `rate/1000 ± 2`). Bytes 1-2 are ignored by the
+  kext. It is not a UAC 10.14/16.16 value. Other lengths are counted; after
+  40 of them the kext stops streaming.
+* The kext keeps a 16 ms ring of frames-per-OUT-microframe (128 slots). Each
+  millisecond's count is spread over its 8 microframes (44 -> 6,5,6,5,6,5,6,5;
+  45 -> 6,6,5,6,5,6,5,6) and the OUT stream reads one slot per packet, so it
+  replays the unit's own frame counts 16 ms later. An out-of-range count
+  ("FramePattern Lost Sync") plays the nominal pattern for that ms; 16 good
+  ms in a row is "Locked".
+* OUT and feedback start on the same USB frame; OUT URBs are 32 microframes
+  (4 ms), feedback URBs 4 packets (4 ms); 3 OUT and 2 feedback URBs at first.
+* `ns7iid` does the same (`ns7ii-usb/src/feedback.rs`), except that it places
+  the write position half a ring ahead of the read position when feedback
+  starts (usbfs cannot start both streams on one frame) and plays an exact
+  rational nominal rate for slots no feedback refreshed. The journal shows
+  `feedback EP 81: first packet [...]` and `feedback locked` at start-up.
 
 ## MIDI
 
@@ -102,6 +123,15 @@ reason to trust the device's own reply).
   3-byte bulk write completes but the unit ignores it (seen on hardware).
   The output pipe is only serviced while the audio streams run
   (`AJ::streamingStarted`). **kext; LED test pending**
+* MIDI OUT pacing in the kext (`AJ::fireOutput` 0x3504,
+  `AJ::outAsyncCompletionRoutine` 0x372c, `AJ::sendRB` 0x366a): event
+  driven, one 42-byte transfer in flight, the next one queued on completion,
+  nothing sent while idle, 500 ms timeouts, no retry. `initNS7` sets all 256
+  pattern entries to 39 MIDI bytes per transfer. `ns7iid` sends from a
+  bounded queue that coalesces messages for the same note / controller
+  (latest value wins), paced to 8000 B/s by default (`--midi-out-rate`),
+  with 500 ms timeouts that halve the rate and clear the endpoint halt; a
+  run of 8 timeouts or a protocol error resets the device. **kext**
 * If the device has a class-compliant MIDIStreaming interface, Linux's
   `snd-usb-audio` already provides it and the daemon leaves it alone unless
   `--take-class-midi` is given (the bridge box needs that).
