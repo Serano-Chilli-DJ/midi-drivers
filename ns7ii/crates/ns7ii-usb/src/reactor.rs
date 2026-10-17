@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -23,6 +23,11 @@ pub enum Action {
     Resubmit,
     /// Keep it parked; the stream is stopping.
     Park,
+    /// The endpoint reported a stall (EPIPE): clear the halt, then resubmit.
+    ClearHaltAndResubmit,
+    /// The stream cannot continue (device error); park it and report `reason`
+    /// through [`Reactor::fault`] so the owner can recover the device.
+    Fail(&'static str),
 }
 
 /// Completion callback for one stream. Runs on the reactor thread, so it
@@ -59,6 +64,7 @@ pub struct Reactor {
     thread: Option<JoinHandle<()>>,
     next_id: AtomicUsize,
     disconnected: Arc<AtomicBool>,
+    fault: Arc<Mutex<Option<String>>>,
 }
 
 static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
@@ -75,11 +81,20 @@ impl Reactor {
         let d = Arc::clone(&dev);
         let disconnected = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&disconnected);
+        let fault = Arc::new(Mutex::new(None));
+        let f2 = Arc::clone(&fault);
         let thread = thread::Builder::new()
             .name("ns7ii-usb-reactor".into())
-            .spawn(move || run(d, rx, flag))
+            .spawn(move || run(d, rx, flag, f2))
             .expect("spawn reactor thread");
-        Self { dev, tx, thread: Some(thread), next_id: AtomicUsize::new(1), disconnected }
+        Self { dev, tx, thread: Some(thread), next_id: AtomicUsize::new(1), disconnected, fault }
+    }
+
+    /// The first stream failure since start (a URB that could not be
+    /// resubmitted, a handler giving up), if any. A device with a fault no
+    /// longer streams everything it should and needs a restart or reset.
+    pub fn fault(&self) -> Option<String> {
+        self.fault.lock().unwrap().clone()
     }
 
     /// True once the device has gone away (reap returned ENODEV).
@@ -131,10 +146,19 @@ fn dev_fd(dev: &UsbfsDevice) -> i32 {
     dev.as_raw_fd()
 }
 
-fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>, disconnected: Arc<AtomicBool>) {
+fn set_fault(fault: &Mutex<Option<String>>, reason: String) {
+    let mut f = fault.lock().unwrap();
+    if f.is_none() {
+        warn!("USB stream fault: {reason}");
+        *f = Some(reason);
+    }
+}
+
+fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>, disconnected: Arc<AtomicBool>, fault: Arc<Mutex<Option<String>>>) {
     let mut streams: HashMap<StreamId, StreamState> = HashMap::new();
     let mut token_owner: HashMap<usize, StreamId> = HashMap::new();
     let mut shutdown = false;
+    let mut reap_errors = 0u32;
     loop {
         // Commands.
         loop {
@@ -169,7 +193,7 @@ fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>, disconnected: Arc<AtomicBoo
                                         st.in_flight -= 1;
                                     } else {
                                         // Belongs to another stream: dispatch below.
-                                        dispatch(&dev, &mut streams, &mut token_owner, tok);
+                                        dispatch(&dev, &mut streams, &mut token_owner, tok, &fault);
                                     }
                                 }
                                 Err(_) => break,
@@ -229,14 +253,29 @@ fn run(dev: Arc<UsbfsDevice>, rx: Receiver<Command>, disconnected: Arc<AtomicBoo
             poll_completion(&dev, 5);
             loop {
                 match dev.try_reap() {
-                    Ok(Some(tok)) => dispatch(&dev, &mut streams, &mut token_owner, tok),
+                    Ok(Some(tok)) => {
+                        reap_errors = 0;
+                        dispatch(&dev, &mut streams, &mut token_owner, tok, &fault)
+                    }
                     Ok(None) => break,
-                    Err(e) => {
-                        // ENODEV: device unplugged. Park everything.
-                        warn!("reap failed: {e}");
-                        if e.raw_os_error() == Some(libc::ENODEV) {
-                            disconnected.store(true, Ordering::SeqCst);
+                    Err(e) if e.raw_os_error() != Some(libc::ENODEV) => {
+                        // Not a disconnect: the URBs are still the kernel's, so
+                        // they must not be treated as reaped. Report and retry.
+                        reap_errors += 1;
+                        if reap_errors == 1 || reap_errors % 1000 == 0 {
+                            warn!("reap failed ({reap_errors}x): {e}");
                         }
+                        if reap_errors == 100 {
+                            set_fault(&fault, format!("reaping URBs keeps failing: {e}"));
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                        break;
+                    }
+                    Err(e) => {
+                        // ENODEV: device unplugged (or reset away). usbfs returns it
+                        // only after every killed URB has been reaped. Park everything.
+                        warn!("reap failed: {e}; the NS7II left the bus");
+                        disconnected.store(true, Ordering::SeqCst);
                         for st in streams.values_mut() {
                             st.stopping = true;
                             for urb in st.urbs.values_mut() {
@@ -266,6 +305,7 @@ fn dispatch(
     streams: &mut HashMap<StreamId, StreamState>,
     token_owner: &mut HashMap<usize, StreamId>,
     token: usize,
+    fault: &Mutex<Option<String>>,
 ) {
     let Some(id) = token_owner.get(&token).copied() else {
         warn!("reaped unknown URB token {token}");
@@ -284,15 +324,37 @@ fn dispatch(
         }
         return;
     }
+    let ep = urb.endpoint();
     let action = st.handler.complete(urb);
-    if action == Action::Resubmit {
+    let resubmit = match action {
+        Action::Resubmit => true,
+        Action::ClearHaltAndResubmit => {
+            match dev.clear_halt(ep) {
+                Ok(()) => debug!("EP {ep:02x} stalled; halt cleared"),
+                Err(e) => warn!("EP {ep:02x} stalled and CLEAR_HALT failed: {e}"),
+            }
+            true
+        }
+        Action::Park => false,
+        Action::Fail(reason) => {
+            set_fault(fault, format!("EP {ep:02x}: {reason} (status {})", urb.status()));
+            false
+        }
+    };
+    if resubmit {
         match dev.submit(urb) {
             Ok(()) => st.in_flight += 1,
             Err(e) => {
-                warn!("resubmit failed on EP {:02x}: {e}", urb.endpoint());
+                warn!("resubmit failed on EP {ep:02x}: {e}");
                 st.stopping = true;
+                if e.raw_os_error() != Some(libc::ENODEV) {
+                    set_fault(fault, format!("resubmit failed on EP {ep:02x}: {e}"));
+                }
             }
         }
+    } else if !st.stopping {
+        // Parked by its handler: the stream is over.
+        st.stopping = true;
     }
 }
 

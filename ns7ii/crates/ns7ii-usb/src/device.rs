@@ -9,7 +9,7 @@ use ns7ii_proto::requests::{self, ControlRequest, FirmwareInfo, RequestData};
 use ns7ii_proto::{classes, PRODUCT_ID, VENDOR_ID};
 use std::collections::VecDeque;
 use std::io;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -365,10 +365,25 @@ impl Ns7ii {
     }
 
     /// Start a bulk/interrupt IN stream. Completed transfers are delivered on
-    /// the returned channel. `urbs` transfers of `packets * wMaxPacketSize`
-    /// bytes stay in flight.
+    /// the returned channel, which holds at most [`BULK_IN_QUEUE`] transfers:
+    /// when the reader falls behind, newer transfers are dropped and counted
+    /// in [`BulkStats::dropped`] instead of growing memory. `urbs` transfers
+    /// of `packets * wMaxPacketSize` bytes stay in flight.
     pub fn start_bulk_in(&self, ep: &Endpoint, urbs: usize, packets: usize) -> Result<BulkInStream> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(BULK_IN_QUEUE);
+        let (id, stats) = self.start_bulk_in_to(ep, urbs, packets, tx)?;
+        Ok(BulkInStream { id, rx, stats })
+    }
+
+    /// Like [`Ns7ii::start_bulk_in`], delivering into an existing bounded
+    /// channel (which may outlive this device, e.g. across a reconnect).
+    pub fn start_bulk_in_to(
+        &self,
+        ep: &Endpoint,
+        urbs: usize,
+        packets: usize,
+        tx: SyncSender<Vec<u8>>,
+    ) -> Result<(StreamId, Arc<Mutex<BulkStats>>)> {
         let typ = if ep.kind == EndpointKind::Interrupt { urb_type::INTERRUPT } else { urb_type::BULK };
         let mut list = Vec::new();
         for _ in 0..urbs.max(1) {
@@ -377,13 +392,30 @@ impl Ns7ii {
             list.push(u);
         }
         let stats = Arc::new(Mutex::new(BulkStats::default()));
-        let id = self.reactor.add_stream(list, Box::new(BulkInHandler { tx, stats: Arc::clone(&stats) }))?;
-        Ok(BulkInStream { id, rx, stats })
+        let id = self
+            .reactor
+            .add_stream(list, Box::new(BulkInHandler { tx, stats: Arc::clone(&stats), consecutive_errors: 0 }))?;
+        Ok((id, stats))
     }
 
     /// Stop and remove a stream.
     pub fn stop(&self, id: StreamId) {
         self.reactor.remove_stream(id);
+    }
+
+    /// The first stream failure the reactor saw, if any (see [`Reactor::fault`]).
+    pub fn fault(&self) -> Option<String> {
+        self.reactor.fault()
+    }
+
+    /// Reset the device's USB port (`USBDEVFS_RESET`) through a fresh handle
+    /// on `info`'s node. Call it with no `Ns7ii` open on the device: the
+    /// kernel drops every usbfs claim on reset, so the device has to be opened,
+    /// claimed and handshaken again afterwards (it may also re-enumerate).
+    pub fn reset_port(info: &SysfsDevice) -> Result<()> {
+        let dev = UsbfsDevice::open(&info.devnode())?;
+        dev.reset()?;
+        Ok(())
     }
 
     /// Clear a halted endpoint.
@@ -404,6 +436,27 @@ impl Ns7ii {
             self.dev().bulk(ep.address, &mut buf, Duration::from_millis(1000))?;
         }
         Ok(data.len())
+    }
+
+    /// Send one NS7II MIDI OUT transfer carrying `payload` (at most
+    /// [`ns7ii_proto::midi::OUT_FRAME_PAYLOAD`] bytes of whole messages),
+    /// waiting at most `timeout`. The error keeps the errno (ETIMEDOUT when
+    /// the unit NAKed for the whole timeout) so the caller can back off.
+    pub fn midi_write_transfer(&self, payload: &[u8], timeout: Duration) -> io::Result<()> {
+        let Some(ep) = &self.plan.midi_out else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no MIDI OUT endpoint"));
+        };
+        use ns7ii_proto::midi::{IDLE_BYTE, OUT_CONTROL_BYTE, OUT_FRAME_LEN, OUT_FRAME_PAYLOAD};
+        let n = payload.len().min(OUT_FRAME_PAYLOAD);
+        let mut buf = [IDLE_BYTE; OUT_FRAME_LEN];
+        buf[..n].copy_from_slice(&payload[..n]);
+        buf[OUT_FRAME_LEN - 1] = OUT_CONTROL_BYTE;
+        self.dev().bulk(ep.address, &mut buf, timeout).map(|_| ())
+    }
+
+    /// MIDI OUT endpoint address, if the plan has one.
+    pub fn midi_out_ep(&self) -> Option<u8> {
+        self.plan.midi_out.as_ref().map(|e| e.address)
     }
 
     /// Start an isochronous OUT stream fed by `source`.
@@ -466,7 +519,16 @@ pub struct BulkStats {
     pub last_error: i32,
     /// Bytes received.
     pub bytes: u64,
+    /// Transfers dropped because the reader fell behind (bounded queue full).
+    pub dropped: u64,
 }
+
+/// Transfers a bulk IN stream's channel holds before newer ones are dropped.
+pub const BULK_IN_QUEUE: usize = 256;
+
+/// Consecutive failed transfers after which a bulk IN stream gives up and
+/// reports a fault (the device needs a reset).
+const BULK_MAX_CONSECUTIVE_ERRORS: u32 = 200;
 
 /// A running bulk IN stream.
 pub struct BulkInStream {
@@ -479,8 +541,9 @@ pub struct BulkInStream {
 }
 
 struct BulkInHandler {
-    tx: Sender<Vec<u8>>,
+    tx: SyncSender<Vec<u8>>,
     stats: Arc<Mutex<BulkStats>>,
+    consecutive_errors: u32,
 }
 
 impl UrbHandler for BulkInHandler {
@@ -496,20 +559,59 @@ impl UrbHandler for BulkInHandler {
                 s.last_error = st;
             }
         }
-        if st != 0 && st != -libc::EOVERFLOW {
-            if st == -libc::ENODEV || st == -libc::ESHUTDOWN {
-                return Action::Park;
+        match bulk_status_action(st, self.consecutive_errors) {
+            BulkStatus::Ok => self.consecutive_errors = 0,
+            BulkStatus::Gone => return Action::Park,
+            BulkStatus::Stalled => {
+                self.consecutive_errors += 1;
+                return Action::ClearHaltAndResubmit;
             }
-            debug!("bulk IN EP {:02x} status {st}", urb.endpoint());
-            if st == -libc::EPIPE {
-                // Halted endpoint: clear and keep going.
-                let _ = self.tx.send(Vec::new());
+            BulkStatus::Retry => {
+                self.consecutive_errors += 1;
+                debug!("bulk IN EP {:02x} status {st}", urb.endpoint());
             }
+            BulkStatus::GiveUp => return Action::Fail("bulk IN keeps failing"),
         }
-        if n > 0 && self.tx.send(urb.buffer()[..n].to_vec()).is_err() {
-            return Action::Park;
+        if n > 0 {
+            match self.tx.try_send(urb.buffer()[..n].to_vec()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => self.stats.lock().unwrap().dropped += 1,
+                Err(TrySendError::Disconnected(_)) => return Action::Park,
+            }
         }
         Action::Resubmit
+    }
+}
+
+/// What a bulk IN completion status means for the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkStatus {
+    /// Data (or a harmless overflow).
+    Ok,
+    /// Device unplugged: stop quietly, the reactor reports the disconnect.
+    Gone,
+    /// Endpoint halted: clear it and resubmit.
+    Stalled,
+    /// Transient transfer error: resubmit.
+    Retry,
+    /// Too many errors in a row: report a fault.
+    GiveUp,
+}
+
+fn bulk_status_action(st: i32, consecutive_errors: u32) -> BulkStatus {
+    if st == 0 || st == -libc::EOVERFLOW {
+        return BulkStatus::Ok;
+    }
+    if st == -libc::ENODEV {
+        return BulkStatus::Gone;
+    }
+    if consecutive_errors >= BULK_MAX_CONSECUTIVE_ERRORS || st == -libc::ESHUTDOWN {
+        return BulkStatus::GiveUp;
+    }
+    if st == -libc::EPIPE {
+        BulkStatus::Stalled
+    } else {
+        BulkStatus::Retry
     }
 }
 
@@ -763,6 +865,18 @@ mod tests {
         assert_eq!(p.current(), nominal);
         p.feedback(nominal + 100);
         assert_eq!(p.current(), nominal + 100);
+    }
+
+    #[test]
+    fn bulk_statuses_map_to_recovery_actions() {
+        assert_eq!(bulk_status_action(0, 5), BulkStatus::Ok);
+        assert_eq!(bulk_status_action(-libc::EOVERFLOW, 0), BulkStatus::Ok);
+        assert_eq!(bulk_status_action(-libc::ENODEV, 0), BulkStatus::Gone);
+        assert_eq!(bulk_status_action(-libc::EPIPE, 0), BulkStatus::Stalled);
+        assert_eq!(bulk_status_action(-libc::EPROTO, 3), BulkStatus::Retry);
+        assert_eq!(bulk_status_action(-libc::ETIMEDOUT, 3), BulkStatus::Retry);
+        assert_eq!(bulk_status_action(-libc::EPROTO, BULK_MAX_CONSECUTIVE_ERRORS), BulkStatus::GiveUp);
+        assert_eq!(bulk_status_action(-libc::ESHUTDOWN, 0), BulkStatus::GiveUp);
     }
 
     #[test]
