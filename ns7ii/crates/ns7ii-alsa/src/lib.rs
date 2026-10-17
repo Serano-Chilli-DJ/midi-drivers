@@ -11,7 +11,7 @@
 //! * [`SeqPort`]: an ALSA sequencer client with one input and one output
 //!   port, speaking raw MIDI bytes (Mixxx and every DAW connect to it).
 //! * [`Pcm`]: blocking `S24_3LE` playback and capture on any ALSA PCM
-//!   (`hw:Loopback,0,0` for apps, or the gadget's UAC2 card on the bridge box).
+//!   (`plughw:Loopback,1,0` for the loopback bridge, or the gadget's UAC2 card on the bridge box).
 
 #![warn(missing_docs)]
 
@@ -36,6 +36,16 @@ pub enum Error {
         /// Negative errno.
         code: c_int,
     },
+}
+
+impl Error {
+    /// The negative errno of a failed ALSA call (`None` for load errors).
+    pub fn code(&self) -> Option<c_int> {
+        match self {
+            Error::Call { code, .. } => Some(*code),
+            Error::Load(_) => None,
+        }
+    }
 }
 
 /// Result alias.
@@ -101,7 +111,17 @@ struct Api {
     pcm_recover: unsafe extern "C" fn(*mut SndPcm, c_int, c_int) -> c_int,
 }
 
-/// A loaded `libasound`.
+impl Api {
+    /// An [`Error::Call`] with `snd_strerror`'s text for `code`.
+    fn error(&self, call: &'static str, code: c_int) -> Error {
+        // SAFETY: snd_strerror returns a static string for any code.
+        let msg = unsafe { std::ffi::CStr::from_ptr((self.strerror)(code)) }.to_string_lossy().into_owned();
+        Error::Call { call, msg, code }
+    }
+}
+
+/// A loaded `libasound` (cheap to clone: the library is shared).
+#[derive(Clone)]
 pub struct Alsa {
     api: std::sync::Arc<Api>,
 }
@@ -149,9 +169,7 @@ impl Alsa {
 
     fn check(&self, call: &'static str, code: c_int) -> Result<c_int> {
         if code < 0 {
-            // SAFETY: snd_strerror returns a static string for any code.
-            let msg = unsafe { std::ffi::CStr::from_ptr((self.api.strerror)(code)) }.to_string_lossy().into_owned();
-            Err(Error::Call { call, msg, code })
+            Err(self.api.error(call, code))
         } else {
             Ok(code)
         }
@@ -192,6 +210,11 @@ impl Alsa {
     }
 
     /// Open a PCM for playback or capture, `S24_3LE` interleaved.
+    ///
+    /// Uses `snd_pcm_set_params` with software resampling allowed, so a
+    /// `plughw:` (or `default`/`plug:`) name converts to whatever format,
+    /// channel count and rate the device, or a loopback's other end, has
+    /// already settled on. A bare `hw:` name must accept exactly these.
     pub fn open_pcm(&self, name: &str, capture: bool, channels: u32, rate: u32, latency_us: u32) -> Result<Pcm> {
         let mut pcm: *mut SndPcm = ptr::null_mut();
         let cname = CString::new(name).unwrap();
@@ -322,7 +345,9 @@ impl Pcm {
         self.channels
     }
 
-    /// Write interleaved `S24_3LE` bytes (whole frames). Recovers from xruns.
+    /// Write interleaved `S24_3LE` bytes (whole frames). Recovers from xruns;
+    /// other errors (EIO when a loopback's other end changed format, ENODEV
+    /// when the card went away) are returned, and the caller should reopen.
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize> {
         assert!(!self.capture);
         let frame = self.channels * 3;
@@ -336,12 +361,13 @@ impl Pcm {
             // SAFETY: valid handle.
             let rec = unsafe { (self.alsa.pcm_recover)(self.pcm, r as c_int, 1) };
             if rec < 0 {
-                return Err(Error::Call { call: "snd_pcm_writei", msg: String::new(), code: r as c_int });
+                return Err(self.alsa.error("snd_pcm_writei", r as c_int));
             }
         }
     }
 
-    /// Read interleaved `S24_3LE` bytes (whole frames). Recovers from xruns.
+    /// Read interleaved `S24_3LE` bytes (whole frames). Recovers from xruns;
+    /// other errors are returned as for [`Pcm::write`].
     pub fn read(&mut self, bytes: &mut [u8]) -> Result<usize> {
         assert!(self.capture);
         let frame = self.channels * 3;
@@ -355,7 +381,7 @@ impl Pcm {
             // SAFETY: valid handle.
             let rec = unsafe { (self.alsa.pcm_recover)(self.pcm, r as c_int, 1) };
             if rec < 0 {
-                return Err(Error::Call { call: "snd_pcm_readi", msg: String::new(), code: r as c_int });
+                return Err(self.alsa.error("snd_pcm_readi", r as c_int));
             }
         }
     }
@@ -365,7 +391,7 @@ impl Pcm {
         // SAFETY: valid handle.
         let r = unsafe { (self.alsa.pcm_prepare)(self.pcm) };
         if r < 0 {
-            Err(Error::Call { call: "snd_pcm_prepare", msg: String::new(), code: r })
+            Err(self.alsa.error("snd_pcm_prepare", r))
         } else {
             Ok(())
         }
