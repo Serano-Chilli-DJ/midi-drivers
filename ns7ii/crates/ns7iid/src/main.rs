@@ -12,6 +12,7 @@
 mod bridge;
 mod chart;
 mod learn;
+mod midi_out;
 mod mixxx;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -142,6 +143,13 @@ enum Cmd {
         /// ALSA client name.
         #[arg(long, default_value = "Numark NS7II")]
         client_name: String,
+        /// MIDI bytes per second sent to the unit at most (LED, meter and motor
+        /// messages for the same target are coalesced, so only the latest value waits).
+        #[arg(long, default_value_t = midi_out::DEFAULT_RATE)]
+        midi_out_rate: u32,
+        /// Minimum milliseconds between two MIDI OUT transfers.
+        #[arg(long, default_value_t = midi_out::DEFAULT_GAP_MS)]
+        midi_out_gap_ms: u64,
     },
 }
 
@@ -592,7 +600,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Cmd::Run { pcm_out, pcm_in, no_midi, client_name } => run_daemon(&cli, pcm_out.clone(), pcm_in.clone(), *no_midi, client_name),
+        Cmd::Run { pcm_out, pcm_in, no_midi, client_name, midi_out_rate, midi_out_gap_ms } => {
+            let midi_cfg = midi_out::Config {
+                rate: *midi_out_rate,
+                min_gap: Duration::from_millis(*midi_out_gap_ms),
+                ..midi_out::Config::default()
+            };
+            run_daemon(&cli, pcm_out.clone(), pcm_in.clone(), *no_midi, client_name, midi_cfg)
+        }
     }
 }
 
@@ -626,12 +641,14 @@ fn run_daemon(
     pcm_in: Option<String>,
     no_midi: bool,
     client_name: &str,
+    midi_cfg: midi_out::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ns = Arc::new(open(cli)?);
     let fw = ns.handshake(cli.rate)?;
     let stop = ctrl_c_flag();
     let alsa = ns7ii_alsa::Alsa::load()?;
     let mut threads = Vec::new();
+    let midi_out = midi_out::Shared::new();
 
     // MIDI: device -> sequencer and sequencer -> device.
     if !no_midi {
@@ -641,12 +658,13 @@ fn run_daemon(
             let stream = ns.start_bulk_in(&ep, 4, 1)?;
             let ns2 = Arc::clone(&ns);
             let stop2 = Arc::clone(&stop);
+            let out = Arc::clone(&midi_out);
+            // Device -> apps, and apps -> the paced, coalescing MIDI OUT queue.
             threads.push(std::thread::spawn(move || {
                 let mut clean = Vec::new();
                 let mut outgoing = Vec::new();
-                let mut expander = RunningStatusExpander::new();
                 while !stop2.load(Ordering::SeqCst) {
-                    match stream.rx.recv_timeout(Duration::from_millis(5)) {
+                    match stream.rx.recv_timeout(Duration::from_millis(2)) {
                         Ok(raw) => {
                             clean.clear();
                             strip_filler(&raw, &mut clean);
@@ -661,16 +679,17 @@ fn run_daemon(
                     }
                     outgoing.clear();
                     if let Ok(n) = seq.receive(&mut outgoing) {
-                        if n > 0 && ns2.plan().midi_out.is_some() {
-                            let expanded = expander.expand(&outgoing);
-                            if let Err(e) = ns2.midi_write(&expanded) {
-                                warn!("midi write: {e}");
-                            }
+                        if n > 0 {
+                            out.push(&outgoing);
                         }
                     }
                 }
                 ns2.stop(stream.id);
             }));
+            if ns.plan().midi_out.is_some() {
+                let (out, stop2, ns2) = (Arc::clone(&midi_out), Arc::clone(&stop), Arc::clone(&ns));
+                threads.push(std::thread::spawn(move || midi_out::run(midi_cfg, out, stop2, move || Some(Arc::clone(&ns2)))));
+            }
         } else if ns.plan().class_midi_interface.is_some() {
             println!("MIDI: the device has a class-compliant MIDI interface; the kernel's snd-usb-audio provides it (see `aseqdump -l`).");
         } else {
@@ -796,16 +815,26 @@ fn run_daemon(
     }
 
     println!("running; Ctrl-C to stop");
+    let mut failed = false;
     while !stop.load(Ordering::SeqCst) {
         if !ns.is_connected() {
             info!("NS7II unplugged; exiting");
             stop.store(true, Ordering::SeqCst);
             break;
         }
+        if let Some(why) = midi_out.take_fault() {
+            warn!("{why}; restarting");
+            stop.store(true, Ordering::SeqCst);
+            failed = true;
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     for t in threads {
         let _ = t.join();
+    }
+    if failed {
+        return Err("device fault".into());
     }
     Ok(())
 }
