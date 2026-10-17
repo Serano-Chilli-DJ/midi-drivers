@@ -639,10 +639,18 @@ pub struct IsoOutConfig {
 }
 
 /// Audio samples for playback: interleaved wire-ready bytes pulled by the
-/// reactor. Producers push encoded bytes; underruns play silence.
+/// reactor. Producers push encoded bytes; underruns play silence. Lives as
+/// long as its producer, across device sessions.
 #[derive(Clone, Default)]
 pub struct AudioSource {
-    inner: Arc<Mutex<VecDeque<u8>>>,
+    inner: Arc<Mutex<SourceState>>,
+}
+
+#[derive(Default)]
+struct SourceState {
+    q: VecDeque<u8>,
+    pulled: u64,
+    underrun: u64,
 }
 
 impl AudioSource {
@@ -652,21 +660,41 @@ impl AudioSource {
     }
     /// Queue encoded bytes.
     pub fn push(&self, bytes: &[u8]) {
-        self.inner.lock().unwrap().extend(bytes.iter().copied());
+        self.inner.lock().unwrap().q.extend(bytes.iter().copied());
     }
     /// Bytes currently queued.
     pub fn queued(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().unwrap().q.len()
     }
-    fn pull(&self, out: &mut [u8]) -> usize {
-        let mut q = self.inner.lock().unwrap();
-        let n = out.len().min(q.len());
-        for (i, b) in q.drain(..n).enumerate() {
+    /// Drop the oldest bytes so that at most `bytes` stay queued; returns
+    /// how many were dropped.
+    pub fn trim_to(&self, bytes: usize) -> usize {
+        let mut s = self.inner.lock().unwrap();
+        let n = s.q.len().saturating_sub(bytes);
+        s.q.drain(..n);
+        n
+    }
+    /// Bytes pulled by the consumer so far (audio and silence).
+    pub fn pulled(&self) -> u64 {
+        self.inner.lock().unwrap().pulled
+    }
+    /// Bytes of silence the consumer got because the queue ran dry, so far.
+    pub fn underrun(&self) -> u64 {
+        self.inner.lock().unwrap().underrun
+    }
+    /// Fill `out` from the queue, padding with silence; returns the bytes
+    /// that came from the queue. (The playback stream calls this.)
+    pub fn pull(&self, out: &mut [u8]) -> usize {
+        let mut s = self.inner.lock().unwrap();
+        let n = out.len().min(s.q.len());
+        for (i, b) in s.q.drain(..n).enumerate() {
             out[i] = b;
         }
         for b in &mut out[n..] {
             *b = 0;
         }
+        s.pulled += out.len() as u64;
+        s.underrun += (out.len() - n) as u64;
         n
     }
 }
@@ -835,5 +863,9 @@ mod tests {
         let mut out = [9u8; 6];
         assert_eq!(s.pull(&mut out), 3);
         assert_eq!(out, [1, 2, 3, 0, 0, 0]);
+        assert_eq!((s.pulled(), s.underrun()), (6, 3));
+        s.push(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(s.trim_to(2), 4);
+        assert_eq!(s.queued(), 2);
     }
 }

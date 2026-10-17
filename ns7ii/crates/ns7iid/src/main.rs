@@ -15,6 +15,7 @@ mod daemon;
 mod learn;
 mod midi_out;
 mod mixxx;
+mod playback;
 mod resample;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -152,6 +153,10 @@ enum Cmd {
         /// Minimum milliseconds between two MIDI OUT transfers.
         #[arg(long, default_value_t = midi_out::DEFAULT_GAP_MS)]
         midi_out_gap_ms: u64,
+        /// Milliseconds of app audio kept queued in front of the USB stream
+        /// (held there by clock-drift correction; lower = less latency).
+        #[arg(long, default_value_t = 20)]
+        playback_queue_ms: u32,
     },
 }
 
@@ -608,7 +613,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Cmd::Run { pcm_out, pcm_in, no_midi, client_name, midi_out_rate, midi_out_gap_ms } => {
+        Cmd::Run { pcm_out, pcm_in, no_midi, client_name, midi_out_rate, midi_out_gap_ms, playback_queue_ms } => {
             let midi_cfg = midi_out::Config {
                 rate: *midi_out_rate,
                 min_gap: Duration::from_millis(*midi_out_gap_ms),
@@ -623,6 +628,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 no_midi: *no_midi,
                 client_name: client_name.clone(),
                 midi: midi_cfg,
+                playback_queue_ms: (*playback_queue_ms).max(5),
             };
             let status = daemon::run(opts, ctrl_c_flag())?;
             if status != 0 {

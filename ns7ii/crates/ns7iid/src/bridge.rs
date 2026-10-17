@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 /// What a bridge reads from or writes to (an ALSA PCM, or a test double).
 pub trait PcmIo {
     /// Read whole interleaved frames into `buf`; returns the bytes read.
+    #[allow(dead_code)] // the capture bridge only writes; reading is tested
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ns7ii_alsa::Error>;
     /// Write whole interleaved frames from `buf`; returns the bytes written.
     fn write(&mut self, buf: &[u8]) -> Result<usize, ns7ii_alsa::Error>;
@@ -148,6 +149,7 @@ impl<P: PcmIo, F: FnMut() -> Result<P, ns7ii_alsa::Error>> Bridge<P, F> {
 
     /// Read from the PCM. `None` means it is failing or waiting to be
     /// reopened; the caller should sleep briefly (the error is logged).
+    #[allow(dead_code)] // the playback side moved to `playback`; kept for tests and other bridges
     pub fn read(&mut self, buf: &mut [u8], now: Instant) -> Option<usize> {
         self.io(now, |p| p.read(buf))
     }

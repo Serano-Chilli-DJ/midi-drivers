@@ -61,6 +61,7 @@ pub struct Options {
     pub no_midi: bool,
     pub client_name: String,
     pub midi: midi_out::Config,
+    pub playback_queue_ms: u32,
 }
 
 /// The device of the current session, shared with the threads that write to it.
@@ -457,41 +458,20 @@ pub fn run(opts: Options, stop: Arc<AtomicBool>) -> Result<i32, Box<dyn std::err
 }
 
 fn spawn_playback(opts: &Options, alsa: &ns7ii_alsa::Alsa, out_ch: usize, source: AudioSource, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
-    let out_codec = crate::make_codec(opts.codec, 0, out_ch);
-    let frame_bytes = out_codec.out_frame_bytes();
-    let plain = Plain24 { out_channels: out_ch, in_channels: out_ch };
-    let rate = opts.rate;
-    let mut pcm = opts.pcm_out.as_ref().map(|name| {
-        info!("playback bridge: reading {name} as {out_ch} ch S24_3LE {rate} Hz; a loopback's other end must be opened with the same format (or through plughw:)");
-        let (alsa, name2) = (alsa.clone(), name.clone());
-        bridge::Bridge::start("playback bridge", name, move || alsa.open_pcm(&name2, true, out_ch as u32, rate, 50_000), Instant::now())
+    let codec = crate::make_codec(opts.codec, 0, out_ch);
+    let env = opts.pcm_out.as_ref().map(|name| {
+        info!("playback bridge: reading {name} ({out_ch} ch, S24_3LE, at the app's rate) for the NS7II at {} Hz", opts.rate);
+        crate::playback::AlsaEnv::new(alsa.clone(), name, out_ch as u32, opts.rate)
     });
+    let (rate, queue_ms) = (opts.rate, opts.playback_queue_ms);
     std::thread::spawn(move || {
-        let period = 256usize;
-        let mut in_bytes = vec![0u8; period * out_ch * 3];
-        let mut samples = vec![0i32; period * out_ch];
-        let mut wire = vec![0u8; period * frame_bytes];
-        // Keep roughly 20 ms queued ahead of the USB side.
-        let target = (rate as usize / 50) * frame_bytes;
+        // Without --pcm-out the unit just plays silence.
+        let Some(env) = env else { return };
+        ns7ii_usb::usbfs::raise_thread_priority("playback bridge", 10);
+        let mut pb = crate::playback::Playback::new(env, "playback bridge", out_ch, rate, codec, source, queue_ms, Instant::now());
         while !stop.load(Ordering::SeqCst) {
-            let Some(pcm) = pcm.as_mut() else {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            };
-            if source.queued() > target {
-                std::thread::sleep(Duration::from_millis(2));
-                continue;
-            }
-            match pcm.read(&mut in_bytes, Instant::now()) {
-                Some(n) => {
-                    let got = plain.decode(&in_bytes[..n], &mut samples);
-                    let m = out_codec.encode(&samples[..got], &mut wire);
-                    source.push(&wire[..m]);
-                }
-                // Failing or waiting to reopen (logged, rate-limited);
-                // the device plays silence meanwhile.
-                None => std::thread::sleep(Duration::from_millis(20)),
-            }
+            let wait = pb.step(Instant::now());
+            std::thread::sleep(wait);
         }
     })
 }
