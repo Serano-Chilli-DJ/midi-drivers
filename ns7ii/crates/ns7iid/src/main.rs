@@ -130,10 +130,10 @@ enum Cmd {
     },
     /// Run as a daemon: ALSA sequencer MIDI ports and PCM bridging.
     Run {
-        /// ALSA PCM to read playback audio from, e.g. hw:Loopback,1,0 (apps play into hw:Loopback,0,0).
+        /// ALSA PCM to read playback audio from, e.g. plughw:Loopback,1,0 (apps play into plughw:CARD=Loopback,DEV=0). Use plughw: so ns7iid converts from whatever format, channels and rate the app chose; snd-aloop fails with EIO when hw: ends differ.
         #[arg(long)]
         pcm_out: Option<String>,
-        /// ALSA PCM to write captured audio to, e.g. hw:Loopback,1,0 (apps record from hw:Loopback,0,0).
+        /// ALSA PCM to write captured audio to, e.g. plughw:Loopback,1,0 (apps record from plughw:CARD=Loopback,DEV=0).
         #[arg(long)]
         pcm_in: Option<String>,
         /// Disable MIDI bridging.

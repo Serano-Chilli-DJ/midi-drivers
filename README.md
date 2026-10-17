@@ -54,7 +54,7 @@ Then, with the NS7II plugged in:
 ./target/release/ns7iid midi-dump    # raw MIDI from the control surface
 ./target/release/ns7iid record out.wav --seconds 10
 ./target/release/ns7iid play --seconds 5          # 440 Hz test tone on every output
-./target/release/ns7iid run --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,0
+./target/release/ns7iid run --pcm-out plughw:Loopback,1,0 --pcm-in plughw:Loopback,1,0
 ```
 
 ## Mixxx mapping

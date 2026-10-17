@@ -95,14 +95,24 @@ sound and no errors, try `--codec junction`, then a different `--play-ep`.
 
 ```
 sudo modprobe snd-aloop
-ns7iid run --pcm-out hw:Loopback,1,0 --pcm-in hw:Loopback,1,0
+ns7iid run --pcm-out plughw:Loopback,1,0 --pcm-in plughw:Loopback,1,0
 ```
 
 Both bridges use subdevice 0 of loopback device 1, so apps play into and
-record from the same `hw:Loopback,0,0` (an app that opens
-`hw:CARD=Loopback,DEV=0` without a subdevice gets subdevice 0). The two
-directions are separate cables, so playback can be 4 channels and capture 12.
-Point Mixxx at `hw:Loopback,0,0` for both output and input and
+record from the same `plughw:CARD=Loopback,DEV=0` (subdevice 0 when none is
+given). The two directions are separate cables, so playback can be 4
+channels and capture 12.
+
+snd-aloop only passes audio when both ends of a cable use the same format,
+channel count and rate. ns7iid asks for 4 ch (playback) / 12 ch (capture)
+S24_3LE at 44100 Hz; an app that opens raw `hw:` with, say, 32 channels of
+F32_LE makes the kernel fail ns7iid's side with EIO. `plughw:` converts, so
+use it on ns7iid's side (as above) and, preferably, in the app too. If it
+still happens, ns7iid logs `playback bridge ...: I/O failed: ... Input/output error` once
+per second with the likely cause and keeps reopening the PCM until the
+formats agree.
+
+Point Mixxx at `plughw:CARD=Loopback,DEV=0` for both output and input and
 at the "Numark NS7II" MIDI ports. PipeWire users can instead use
 `pw-loopback` or just leave PipeWire on the loopback card.
 
