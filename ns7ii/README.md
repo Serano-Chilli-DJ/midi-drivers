@@ -17,7 +17,7 @@ on hardware in minutes; see `docs/04-bring-up-guide.md`.
 | `docs/03-converter-box.md` | USB-to-USB bridge: hardware choice, software stack, latency budget |
 | `docs/04-bring-up-guide.md` | Step-by-step hardware verification and what to send back |
 | `docs/05-midi-chart.md` | The NS7II MIDI chart (every button, knob, fader, LED and motor message) |
-| `ns7ii/` | Rust workspace (see below) |
+| `Cargo.toml`, `crates/` | Rust workspace (see below) |
 | `tools/` | Python scripts used to unpack the vendor packages (DMG, pkg, InstallShield, Mach-O disassembly) |
 | `udev/` | udev rule so the driver runs without root |
 | `systemd/`, `modules/`, `alsa/`, `install.sh` | the service, its settings, the snd-aloop card config, the `ns7ii` ALSA device name and the installer |
@@ -26,10 +26,10 @@ on hardware in minutes; see `docs/04-bring-up-guide.md`.
 ## Rust workspace
 
 ```
-ns7ii/crates/ns7ii-proto   protocol: control requests, PCM codecs, MIDI framing   (no unsafe, no I/O, 18 tests)
-ns7ii/crates/ns7ii-usb     transport: sysfs discovery, descriptors, usbfs (bulk + isochronous), URB reactor
-ns7ii/crates/ns7ii-alsa    libasound loaded at run time: sequencer MIDI ports, S24_3LE PCM
-ns7ii/crates/ns7iid        the CLI / daemon
+crates/ns7ii-proto   protocol: control requests, PCM codecs, MIDI framing   (no unsafe, no I/O, 18 tests)
+crates/ns7ii-usb     transport: sysfs discovery, descriptors, usbfs (bulk + isochronous), URB reactor
+crates/ns7ii-alsa    libasound loaded at run time: sequencer MIDI ports, S24_3LE PCM
+crates/ns7iid        the CLI / daemon
 ```
 
 `unsafe` lives in exactly two files: `ns7ii-usb/src/usbfs.rs` (Linux usbfs
@@ -37,13 +37,12 @@ ioctls, because no pure-Rust USB crate offers isochronous transfers yet) and
 `ns7ii-alsa/src/lib.rs` (FFI into libasound). Everything else is `#![forbid(unsafe_code)]`
 or free of it.
 
-Build and test (stable Rust, no C headers needed):
+Build and test (stable Rust, no C headers needed), from this directory:
 
 ```
-cd ns7ii
 cargo test --workspace
 cargo build --release
-sudo install -m644 ../udev/99-numark-ns7ii.rules /etc/udev/rules.d/
+sudo install -m644 udev/99-numark-ns7ii.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ```
 
@@ -63,8 +62,8 @@ Then, with the NS7II plugged in:
 `install.sh` sets up everything a DJ app needs, with no systemd editing:
 
 ```
-cd ns7ii && cargo build --release && cd ..
-sudo ./install.sh ns7ii/target/release/ns7iid     # or a pre-built dist/ns7iid-$(uname -m)
+cargo build --release
+sudo ./install.sh target/release/ns7iid     # or a pre-built dist/ns7iid-$(uname -m)
 ```
 
 It installs `/usr/local/bin/ns7iid`, the udev rule (the service starts when
@@ -206,6 +205,6 @@ and re-signed (and Apple Silicon Macs need a reduced-security boot to load
 any kext at all), and the Windows driver carries a pre-2015 cross-signature
 that Windows 10/11 refuse on fresh installs. The device also is not USB Audio
 Class compliant, so no generic driver picks it up. Both points are solved by
-either a native driver (this repo, Linux) or by the bridge box, which hides
+either a native driver (this directory, Linux) or by the bridge box, which hides
 the proprietary protocol behind a standard USB Audio Class 2 + USB-MIDI
 device that every OS, including iPadOS, drives out of the box.

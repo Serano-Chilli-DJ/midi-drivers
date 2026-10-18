@@ -8,8 +8,8 @@ and send its output.
 Build first (any Linux, stable Rust):
 
 ```
-cd ns7ii && cargo build --release
-sudo install -m644 ../udev/99-numark-ns7ii.rules /etc/udev/rules.d/
+cargo build --release
+sudo install -m644 udev/99-numark-ns7ii.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 export RUST_LOG=debug     # the daemon logs every control transfer
 ```
@@ -122,8 +122,8 @@ is also listed by name: `ns7ii`, "Numark NS7II Audio Controller" (below). PipeWi
 
 ### As an installed service
 
-Once `ns7iid run` works by hand, `sudo ./install.sh ns7ii/target/release/ns7iid`
-(from the repo root, path to the binary you built) makes it permanent: the
+Once `ns7iid run` works by hand, `sudo ./install.sh target/release/ns7iid`
+(from the `ns7ii/` directory, path to the binary you built) makes it permanent: the
 `Loopback` card loads at boot, and the service starts on plug-in with the
 plughw bridge above. Its settings are in `/etc/default/ns7iid`. It also
 installs `/etc/alsa/conf.d/50-ns7ii.conf` (alsa-lib 1.2.6 on Ubuntu / Pop!_OS

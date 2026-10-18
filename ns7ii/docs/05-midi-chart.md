@@ -5,7 +5,7 @@ on the Mixxx forum by SuperC0C0 (2022), checked message by message against a
 `ns7iid midi-learn` capture of a real NS7II (2026-10-15) and against the
 control-surface firmware's MIDI input handlers (`ns7ii_firmware_updater.exe`
 image, see `docs/01-vendor-package-analysis.md`). It is what `ns7iid
-mixxx-map` uses as its built-in chart (`ns7ii/crates/ns7iid/src/chart.rs`).
+mixxx-map` uses as its built-in chart (`crates/ns7iid/src/chart.rs`).
 
 Notation: `9n 34` means note 0x34 on MIDI channel n (status 0x90 + n);
 buttons send velocity 0x7F on press and a note-off (`8n`) on release.
