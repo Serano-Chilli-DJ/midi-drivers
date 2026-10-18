@@ -9,7 +9,7 @@
 //!
 //! Provided:
 //! * [`SeqPort`]: an ALSA sequencer client with one input and one output
-//!   port, speaking raw MIDI bytes (Mixxx and every DAW connect to it).
+//!   port, speaking raw MIDI bytes (any DJ app or DAW connects to it).
 //! * [`Pcm`]: blocking `S24_3LE` playback and capture on any ALSA PCM
 //!   (`plughw:Loopback,1,0` for the loopback bridge, or the gadget's UAC2 card on the bridge box).
 
@@ -209,10 +209,10 @@ impl Alsa {
 
     /// Open a sequencer client named `name` with one duplex port called
     /// `<name> MIDI 1`, the shape the kernel gives class-compliant devices.
-    /// Mixxx pairs a controller's input and output by port name and only
-    /// treats identical names (or `... MIDI <n>` pairs) as one device, so
-    /// separate "MIDI in" / "MIDI out" ports leave it without an output
-    /// path: no LEDs and no motor commands.
+    /// DJ apps commonly pair a controller's input and output by port name
+    /// and only treat identical names (or `... MIDI <n>` pairs) as one
+    /// device, so separate "MIDI in" / "MIDI out" ports leave them without
+    /// an output path: no LEDs and no motor commands.
     pub fn open_seq(&self, name: &str) -> Result<SeqPort> {
         let mut seq: *mut SndSeq = ptr::null_mut();
         let dflt = CString::new("default").unwrap();

@@ -142,59 +142,30 @@ Settings live in `/etc/default/ns7iid` (`NS7IID_AUDIO=0` for MIDI only,
 everything the installer added (an edited `/etc/default/ns7iid` is kept);
 `snd-aloop` stays loaded until reboot or `sudo modprobe -r snd-aloop`.
 
-## Mixxx mapping
+## MIDI chart
 
-Mixxx has no NS7II mapping and Numark never published the MIDI chart. The
-chart is now reconstructed (`docs/05-midi-chart.md`) and built into the
-driver, so a complete mapping is one command away:
+Numark never published the NS7II's MIDI chart. It is reconstructed in
+`docs/05-midi-chart.md` and built into the driver. Mappings for specific
+DJ software are not kept here: they belong with the software that uses the
+controller. What this repo provides is the generic table and the raw MIDI
+port, so any such mapping starts from
 
 ```
-ns7iid mixxx-map          # writes the mapping into Mixxx's controller folder
+ns7iid chart                        # the chart as JSON, in the format midi-learn writes
+ns7iid chart --out ns7ii-chart.json
 ```
-
-It writes `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js` into the
-folder Mixxx scans for user mappings:
-
-| Mixxx install | folder |
-|---------------|--------|
-| native package / AppImage | `~/.mixxx/controllers/` |
-| Flatpak | `~/.var/app/org.mixxx.Mixxx/.mixxx/controllers/` |
-| Snap | `~/snap/mixxx/current/.mixxx/controllers/` |
-
-It picks whichever of these settings folders exists; `--out-dir` overrides
-it. The mapping loads Mixxx's own `lodash.mixxx.js` and
-`midi-components-0.0.js` libraries and works on Mixxx 2.3 (whose QtScript
-engine only understands ES5) and newer; `mixxx-map` warns if a Mixxx
-install on the machine lacks either file.
-Mixxx reads the folder only at start-up, so restart Mixxx afterwards,
-make sure the driver is running (the controller only appears in Mixxx
-while `ns7iid` runs), open Preferences, Controllers, click "Numark NS7II" in
-the list on the left (the controller appears as "Numark NS7II MIDI 1"), choose "Numark NS7II" under Load Mapping, tick
-Enabled and Apply.
 
 The NS7II is a four-deck controller. Its mixer strips are, from left to
 right, channels 3, 1, 2 and 4, and each side's DECK buttons switch that
-side between decks 1/3 or 2/4; every message carries its deck number, so
-the outer strips and the DECK 3 / DECK 4 layers land on Mixxx decks 3 and
-4. Most Mixxx skins hide those until you switch the skin to four decks, so
-either do that or press DECK 1 and DECK 2 on the unit.
+side between decks 1/3 or 2/4; every message carries its deck number. The
+platter motor commands (start, stop, speed, direction, pitch) were decoded
+from the firmware; the pitch scale is unconfirmed on hardware.
 
-The mapping covers all four decks (DECK buttons switch layers), platters,
-strip search, the hot cue row, pads in hot cue / auto loop / manual loop /
-slicer / sampler modes, beat grid buttons, FX, mixer with FX and crossfader
-assign, library, microphone, front panel switches and LEDs. The platter
-motors start and stop with the deck and follow the pitch fader (the motor
-commands were decoded from the firmware; the pitch scale is a setting until
-confirmed on hardware). SHIFT + SLIP MODE turns a deck's motor off, which
-makes its platter a plain jog wheel. Settings such as pitch fader direction,
-platter resolution and motor behaviour are at the top of
-`Numark-NS7II-scripts.js`.
-
-If a control on your unit does not match the chart, `midi-learn` still
-exists: it asks for each control in turn, saves to `ns7ii-learn.json`, and
-`mixxx-map --capture ns7ii-learn.json` lets the captured messages override
-the chart (`--capture-only` ignores the chart entirely). The service holds
-the device, so stop it first: `systemctl stop ns7iid`.
+If a control on your unit does not match the chart, `midi-learn` asks for
+each control in turn and saves to `ns7ii-learn.json`; `chart --capture
+ns7ii-learn.json` lets the captured messages override the chart
+(`--capture-only` ignores the chart entirely). The service holds the
+device, so stop it first: `systemctl stop ns7iid`.
 
 ## One correction to the premise
 

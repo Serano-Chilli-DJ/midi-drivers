@@ -14,7 +14,6 @@ mod chart;
 mod daemon;
 mod learn;
 mod midi_out;
-mod mixxx;
 mod playback;
 mod resample;
 
@@ -86,14 +85,16 @@ enum Cmd {
     },
     /// Send raw MIDI bytes (hex) to the device, e.g. `90 3c 7f`.
     MidiSend { bytes: Vec<String> },
-    /// Guided capture of every control for building a Mixxx mapping.
+    /// Guided capture of every control, for mapping the unit in whatever
+    /// software drives it (same JSON format as `chart`).
     MidiLearn {
         /// Capture file (resumed if it exists).
         #[arg(long, default_value = "ns7ii-learn.json")]
         out: String,
     },
-    /// Generate a Mixxx mapping (XML + JS) from the built-in NS7II chart.
-    MixxxMap {
+    /// Print the built-in NS7II MIDI chart as JSON (the `midi-learn` capture
+    /// format), the generic table a mapping for any DJ software starts from.
+    Chart {
         /// Capture file from `midi-learn` whose entries override the built-in
         /// chart (for a unit that differs, or to add a control).
         #[arg(long)]
@@ -101,11 +102,9 @@ enum Cmd {
         /// Use the capture alone and ignore the built-in chart.
         #[arg(long, requires = "capture")]
         capture_only: bool,
-        /// Directory to write `Numark NS7II.midi.xml` and `Numark-NS7II-scripts.js` into.
-        /// Default: this user's Mixxx controller folder (`~/.mixxx/controllers`, or the
-        /// Flatpak / Snap equivalent, whichever exists).
+        /// Write to this file instead of standard output.
         #[arg(long)]
-        out_dir: Option<String>,
+        out: Option<String>,
     },
     /// Record capture audio to a WAV file.
     Record {
@@ -215,62 +214,6 @@ fn ctrl_c_flag() -> Arc<AtomicBool> {
         libc::signal(libc::SIGTERM, on_sigint as *const () as usize);
     }
     flag
-}
-
-/// Mixxx's user controller folder: `<settings>/controllers`, where the
-/// settings folder is `~/.mixxx` for a native install, or the Flatpak / Snap
-/// sandbox equivalent. Only an existing settings folder counts, so the files
-/// never land where Mixxx would not look.
-fn mixxx_controllers_dir() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    [".mixxx", ".var/app/org.mixxx.Mixxx/.mixxx", "snap/mixxx/current/.mixxx"]
-        .iter()
-        .map(|d| format!("{home}/{d}"))
-        .find(|d| std::path::Path::new(d).is_dir())
-        .map(|d| format!("{d}/controllers"))
-}
-
-/// Folders where a native, Flatpak or Snap Mixxx keeps its bundled
-/// controller scripts, plus the one next to a `mixxx` binary on PATH.
-fn mixxx_resource_dirs() -> Vec<std::path::PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut dirs: Vec<std::path::PathBuf> = [
-        "/usr/share/mixxx/controllers".to_string(),
-        "/usr/local/share/mixxx/controllers".to_string(),
-        "/opt/mixxx/share/mixxx/controllers".to_string(),
-        "/var/lib/flatpak/app/org.mixxx.Mixxx/current/active/files/share/mixxx/controllers".to_string(),
-        format!("{home}/.local/share/flatpak/app/org.mixxx.Mixxx/current/active/files/share/mixxx/controllers"),
-        "/snap/mixxx/current/usr/share/mixxx/controllers".to_string(),
-    ]
-    .into_iter()
-    .map(std::path::PathBuf::from)
-    .collect();
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            if let Ok(real) = std::fs::canonicalize(dir.join("mixxx")) {
-                if let Some(prefix) = real.parent().and_then(|p| p.parent()) {
-                    dirs.push(prefix.join("share/mixxx/controllers"));
-                }
-            }
-        }
-    }
-    dirs.into_iter().filter(|d| d.is_dir()).collect()
-}
-
-/// Warnings for Mixxx libraries the mapping lists that no Mixxx install on
-/// this machine provides. Silent when no Mixxx controllers folder exists at
-/// all, since the mapping may be generated on another machine.
-fn missing_mixxx_libs() -> Vec<String> {
-    let dirs = mixxx_resource_dirs();
-    if dirs.is_empty() {
-        return Vec::new();
-    }
-    let shown: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
-    mixxx::MIXXX_LIBS
-        .iter()
-        .filter(|lib| !dirs.iter().any(|d| d.join(lib).is_file()))
-        .map(|lib| format!("warning: the mapping loads {lib} from Mixxx but it is missing from {}; Mixxx ships it in res/controllers, copy it next to the mapping", shown.join(", ")))
-        .collect()
 }
 
 fn open(cli: &Cli) -> Result<Ns7ii, Box<dyn std::error::Error>> {
@@ -444,10 +387,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ns.stop(stream.id);
             audio.stop(&ns);
             result?;
-            println!("next: ns7iid mixxx-map --capture {out}      (built-in chart, overridden by this capture)");
+            println!("next: ns7iid chart --capture {out}      (built-in chart, overridden by this capture)");
             Ok(())
         }
-        Cmd::MixxxMap { capture, capture_only, out_dir } => {
+        Cmd::Chart { capture, capture_only, out } => {
             let mut learned = chart::builtin();
             if let Some(path) = capture {
                 let cap = learn::Learned::load(path)?;
@@ -462,34 +405,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             n += 1;
                         }
                     }
-                    println!("built-in chart with {n} controls overridden from {path}");
+                    eprintln!("built-in chart with {n} controls overridden from {path}");
                 }
             }
-            let (xml, js, notes) = mixxx::generate(&learned)?;
-            let out_dir = match out_dir {
-                Some(d) => d.clone(),
-                None => mixxx_controllers_dir().ok_or(
-                    "no Mixxx settings folder found (~/.mixxx, Flatpak or Snap); start Mixxx once or pass --out-dir",
-                )?,
-            };
-            std::fs::create_dir_all(&out_dir)?;
-            let xml_path = format!("{out_dir}/Numark NS7II.midi.xml");
-            let js_path = format!("{out_dir}/Numark-NS7II-scripts.js");
-            std::fs::write(&xml_path, xml)?;
-            std::fs::write(&js_path, js)?;
-            for n in &notes {
-                println!("{n}");
+            let json = serde_json::to_string_pretty(&learned)?;
+            match out {
+                Some(path) => {
+                    std::fs::write(path, json + "
+")?;
+                    eprintln!("wrote {path}");
+                }
+                None => {
+                    // A reader such as `head` may close the pipe early; that is not an error.
+                    use std::io::Write as _;
+                    let mut stdout = std::io::stdout().lock();
+                    if let Err(e) = stdout.write_all(json.as_bytes()).and_then(|_| stdout.write_all(b"\n")) {
+                        if e.kind() != std::io::ErrorKind::BrokenPipe {
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
-            println!("wrote {xml_path}\nwrote {js_path}");
-            for w in missing_mixxx_libs() {
-                eprintln!("{w}");
-            }
-            println!("Now: start the driver (systemctl start ns7iid), start Mixxx, open Preferences > Controllers,");
-            println!("click \"Numark NS7II MIDI 1\" in the left list, choose \"Numark NS7II\" under Load Mapping, enable, Apply.");
-            println!("Mixxx reads this folder only at start-up, so restart it if it was running.");
-            println!("The NS7II is a four-deck controller: the outer mixer strips (printed 3 and 4) and the DECK 3 / DECK 4");
-            println!("layers drive Mixxx decks 3 and 4, which most skins hide until you switch them to four decks.");
-            println!("Press DECK 1 and DECK 2 on the unit, or show four decks in Mixxx, or nothing seems to respond.");
             Ok(())
         }
         Cmd::MidiSend { bytes } => {

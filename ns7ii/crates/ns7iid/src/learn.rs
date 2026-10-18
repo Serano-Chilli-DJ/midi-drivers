@@ -1,6 +1,6 @@
 //! Guided MIDI capture: asks the user to touch each control once and records
-//! what the NS7II sends, producing a `learn.json` that `mixxx-map` turns
-//! into a Mixxx mapping.
+//! what the NS7II sends, producing a `learn.json` in the same format as
+//! `ns7iid chart`, for mapping the unit in whatever software drives it.
 
 use ns7ii_proto::midi::{strip_filler, Message, Parser};
 use serde::{Deserialize, Serialize};
@@ -227,7 +227,7 @@ pub struct Learned {
     pub device: String,
     /// Firmware string.
     pub firmware: String,
-    /// Every deck is captured in full (the built-in chart): the generator
+    /// Every deck is captured in full (the built-in chart): a mapping
     /// must not carry controls from one deck to another by offset.
     #[serde(default)]
     pub complete: bool,
@@ -374,7 +374,7 @@ pub fn run(rx: &Receiver<Vec<u8>>, out_path: &str, mut learned: Learned) -> Resu
 
 /// For deck 3 / deck 4 captures: the deck 1 / deck 2 section that already
 /// holds the identical message, if any. Identical means the DECK layer
-/// button had no effect, and mapping both would drive two Mixxx decks at once.
+/// button had no effect, and mapping both would drive two software decks at once.
 fn same_as_other_deck(learned: &Learned, section: &str, id: &str, collected: &[Message]) -> Option<&'static str> {
     let twin = match section {
         "deck3" => "deck1",

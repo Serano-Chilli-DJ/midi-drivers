@@ -115,7 +115,7 @@ still happens, ns7iid logs `playback bridge ...: I/O failed: ... Input/output er
 per second with the likely cause and keeps reopening the PCM until the
 formats agree.
 
-Point Mixxx at `plughw:CARD=Loopback,DEV=0` for both output and input and
+Point the DJ app at `plughw:CARD=Loopback,DEV=0` for both output and input and
 at the "Numark NS7II" MIDI ports. Once `install.sh` has run, the same device
 is also listed by name: `ns7ii`, "Numark NS7II Audio Controller" (below). PipeWire users can instead use
 `pw-loopback` or just leave PipeWire on the loopback card.
@@ -178,30 +178,26 @@ fake PCMs and a fake MIDI endpoint); confirm them on the NS7II:
    app runs: the journal should show `left the USB bus`, `NS7II reopened and
    handshaken`, `NS7II streaming`, and the app keeps its MIDI connection.
 
-## Step 7: Mixxx mapping
+## Step 7: MIDI chart
 
 ```
-ns7iid mixxx-map                  # built-in chart -> ~/.mixxx/controllers (or the Flatpak / Snap folder)
+ns7iid chart                      # the built-in chart as JSON (docs/05-midi-chart.md as data)
 ```
 
-Then start the driver, restart Mixxx, open Preferences, Controllers, click
-"Numark NS7II" on the left and pick the "Numark NS7II" mapping under Load
-Mapping. The chart is in `docs/05-midi-chart.md`.
-
-If a control misbehaves, capture it from the unit and let the capture
-override the chart:
+Mappings for a particular DJ application are built from this chart and
+live with that application, not in this repo. If a control misbehaves,
+capture it from the unit and let the capture override the chart:
 
 ```
 systemctl stop ns7iid
 ns7iid midi-learn                 # Enter skips, r redoes, s skips the section, q saves and quits
-ns7iid mixxx-map --capture ns7ii-learn.json
+ns7iid chart --capture ns7ii-learn.json
 systemctl start ns7iid
 ```
 
-`mixxx-map` prints what it mapped and what a capture still lacks. For the
-deck 3 and 4 prompts press the DECK button first; when a deck 3/4 capture
-equals deck 1/2 the DECK button had no effect and that deck is left
-unmapped rather than driving two Mixxx decks at once.
+For the deck 3 and 4 prompts press the DECK button first; when a deck 3/4
+capture equals deck 1/2 the DECK button had no effect and that deck is
+left out rather than driving two software decks at once.
 
 ## What to send back
 

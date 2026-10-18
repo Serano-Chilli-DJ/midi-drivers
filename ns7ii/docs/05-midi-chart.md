@@ -1,11 +1,12 @@
 # Numark NS7II MIDI chart
 
 Numark never published this. The table was assembled from a capture posted
-on the Mixxx forum by SuperC0C0 (2022), checked message by message against a
+on a DJ forum by SuperC0C0 (2022), checked message by message against a
 `ns7iid midi-learn` capture of a real NS7II (2026-10-15) and against the
 control-surface firmware's MIDI input handlers (`ns7ii_firmware_updater.exe`
-image, see `docs/01-vendor-package-analysis.md`). It is what `ns7iid
-mixxx-map` uses as its built-in chart (`crates/ns7iid/src/chart.rs`).
+image, see `docs/01-vendor-package-analysis.md`). It is built into the
+driver (`crates/ns7iid/src/chart.rs`); `ns7iid chart` prints it as JSON for
+building a mapping in whatever software drives the unit.
 
 Notation: `9n 34` means note 0x34 on MIDI channel n (status 0x90 + n);
 buttons send velocity 0x7F on press and a note-off (`8n`) on release.
@@ -133,9 +134,9 @@ Crossfader `B0 07` / `B0 27`; crossfader slope `B0 41`.
 | Motor torque switch | `90 74` |
 | BPM meter (host to device) | `B0 47`, value 0–11 |
 
-## Not mapped by `mixxx-map`
+## Marked silent in the built-in chart
 
 Knob touch notes, channel pressure, input selectors, the touch mode and
 filter mode buttons, the motor torque switch and the second 14-bit motor
-value. They are in the built-in chart as silent controls, so the
-generated script can be extended without touching the XML.
+value. They are in the built-in chart as silent controls: present with
+their messages, flagged for a mapping to ignore unless it wants them.

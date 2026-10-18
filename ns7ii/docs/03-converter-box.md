@@ -68,13 +68,13 @@ controller supports isochronous IN/OUT at high speed; UAC2 gadgets at 44.1 kHz
    NS7II's clock and no resampler is needed. Latency budget: NS7II USB
    (≈2 ms) + bridge buffers (ns7iid keeps ≈20 ms queued by default; tune
    to 5 ms once stable) + computer's UAC2 driver (3–10 ms). Expect 15–35 ms
-   round trip; Serato/Mixxx monitoring goes through the NS7II's hardware
+   round trip; headphone monitoring goes through the NS7II's hardware
    mixer, so this latency only affects deck audio start and cue-point
    scratch feel, which is why a tuned 5 ms bridge buffer is worth it.
 4. **Serato DJ** will not run on the bridged device (it checks for the NS7II
    by USB ID), but Mixxx, Traktor, VirtualDJ, Rekordbox and djay will treat
-   it as a generic MIDI controller with a multichannel sound card. Mixxx
-   already has an NS7II controller mapping for the MIDI side.
+   it as a generic MIDI controller with a multichannel sound card, each
+   with its own mapping built from the chart in `05-midi-chart.md`.
 
 ### Gadget script (sketch, run as root on the box)
 

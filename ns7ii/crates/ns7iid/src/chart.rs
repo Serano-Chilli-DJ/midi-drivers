@@ -1,6 +1,6 @@
-//! The NS7II MIDI chart, built in, so `mixxx-map` needs no capture.
+//! The NS7II MIDI chart, built in, so `ns7iid chart` needs no capture.
 //!
-//! Sources: SuperC0C0's capture spreadsheet on the Mixxx forum (2022),
+//! Sources: SuperC0C0's capture spreadsheet (2022, posted on a DJ forum),
 //! cross-checked message by message against a `midi-learn` capture of a
 //! real unit (2026-10-15) and against the control-surface firmware's MIDI
 //! input handlers. Every message here was seen on hardware; see
