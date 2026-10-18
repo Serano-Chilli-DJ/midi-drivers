@@ -116,7 +116,8 @@ per second with the likely cause and keeps reopening the PCM until the
 formats agree.
 
 Point Mixxx at `plughw:CARD=Loopback,DEV=0` for both output and input and
-at the "Numark NS7II" MIDI ports. PipeWire users can instead use
+at the "Numark NS7II" MIDI ports. Once `install.sh` has run, the same device
+is also listed by name: `ns7ii`, "Numark NS7II Audio Controller" (below). PipeWire users can instead use
 `pw-loopback` or just leave PipeWire on the loopback card.
 
 ### As an installed service
@@ -124,16 +125,22 @@ at the "Numark NS7II" MIDI ports. PipeWire users can instead use
 Once `ns7iid run` works by hand, `sudo ./install.sh ns7ii/target/release/ns7iid`
 (from the repo root, path to the binary you built) makes it permanent: the
 `Loopback` card loads at boot, and the service starts on plug-in with the
-plughw bridge above. Its settings are in `/etc/default/ns7iid`.
+plughw bridge above. Its settings are in `/etc/default/ns7iid`. It also
+installs `/etc/alsa/conf.d/50-ns7ii.conf` (alsa-lib 1.2.6 on Ubuntu / Pop!_OS
+22.04 reads that folder by default), which names the app end of the loopback
+`ns7ii`: a plug PCM on `hw:CARD=Loopback,DEV=0,SUBDEV=0` with the description
+"Numark NS7II Audio Controller", for output and input, passing the app's
+channel count through (4 for master + cue, 2 for stereo).
 
 ```
 systemctl status ns7iid
 journalctl -u ns7iid -f
-aplay -D plughw:CARD=Loopback,DEV=0 -r 44100 -c 2 some.wav    # sound on Master OUT
+aplay -D ns7ii -r 44100 -c 2 some.wav                         # sound on Master OUT
+aplay -L | grep -A1 ns7ii                                     # "Numark NS7II Audio Controller"
 cat /proc/asound/cards                                        # a "Loopback" card
 ```
 
-Apps should open `plughw:CARD=Loopback,DEV=0` for output and input. If the
+Apps should open `ns7ii` (or `plughw:CARD=Loopback,DEV=0`) for output and input. If the
 journal repeats `I/O failed ... Input/output error`, an app holds the
 loopback in a format ns7iid cannot convert to; switch the app to plughw.
 
@@ -142,7 +149,7 @@ loopback in a format ns7iid cannot convert to; switch the app to plughw.
 * Run by hand for debugging: `sudo systemctl stop ns7iid`, then
   `RUST_LOG=debug ns7iid run --pcm-out plughw:Loopback,1,0 --pcm-in plughw:Loopback,1,0`.
 * Roll back: `sudo ./install.sh --uninstall` removes the binary, unit,
-  helper, udev rule and module config (and `/etc/default/ns7iid` unless
+  helper, udev rule, module config and ALSA config (and `/etc/default/ns7iid` unless
   edited); reboot or `sudo modprobe -r snd-aloop` to drop the card.
 
 ### Audio quality, drift and recovery checks (need the hardware)

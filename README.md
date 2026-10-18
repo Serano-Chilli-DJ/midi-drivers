@@ -20,7 +20,7 @@ on hardware in minutes; see `docs/04-bring-up-guide.md`.
 | `ns7ii/` | Rust workspace (see below) |
 | `tools/` | Python scripts used to unpack the vendor packages (DMG, pkg, InstallShield, Mach-O disassembly) |
 | `udev/` | udev rule so the driver runs without root |
-| `systemd/`, `modules/`, `install.sh` | the service, its settings, the snd-aloop card config and the installer |
+| `systemd/`, `modules/`, `alsa/`, `install.sh` | the service, its settings, the snd-aloop card config, the `ns7ii` ALSA device name and the installer |
 | `tmp/` | The vendor downloads (not tracked) |
 
 ## Rust workspace
@@ -72,6 +72,7 @@ the NS7II is plugged in and exits when it is unplugged), the
 `ns7iid.service` unit with its `/usr/local/libexec/ns7iid-start` helper,
 `/etc/modules-load.d/ns7ii.conf` and `/etc/modprobe.d/ns7ii-aloop.conf`
 (the `snd-aloop` card, loaded at boot with the id `Loopback`, never card 0),
+`/etc/alsa/conf.d/50-ns7ii.conf` (the ALSA device `ns7ii`, see below),
 and `/etc/default/ns7iid` (only if absent; your edits survive reinstalls).
 Running it again updates everything in place.
 
@@ -80,10 +81,18 @@ appear on the other end of the loopback. In the DJ app choose
 
 | | |
 |---|---|
-| audio output and input | `plughw:CARD=Loopback,DEV=0` (ALSA) |
+| audio output and input | `ns7ii` "Numark NS7II Audio Controller" (ALSA) |
 | MIDI controller | "Numark NS7II MIDI 1" |
 
-`plughw:` lets the app use any format, channel count and rate. For playback
+`ns7ii` is a named plug PCM on `hw:CARD=Loopback,DEV=0,SUBDEV=0`, defined in
+`alsa/50-ns7ii.conf`; `aplay -L`, `arecord -L` and apps that list ALSA
+devices show it as "Numark NS7II Audio Controller". alsa-lib 1.2.x (1.2.6 on
+Ubuntu / Pop!_OS 22.04) reads `/etc/alsa/conf.d/*.conf` by default, so
+nothing else needs editing. Apps that only take a raw device string can use
+the equivalent `plughw:CARD=Loopback,DEV=0`.
+Like `plughw:`, it lets the app use any format, channel count and rate, and
+passes the channel count through: 4 channels give master on 1-2 and cue on
+3-4, plain stereo apps get the master. For playback
 ns7iid opens its end of the loopback only once an app has opened the other
 end, takes the app's rate as it is and converts it to the NS7II's 44.1 kHz
 itself with a band-limited resampler that also absorbs the clock difference
@@ -97,7 +106,8 @@ Check it:
 ```
 systemctl status ns7iid
 journalctl -u ns7iid -f            # "playback bridge: reading plughw:CARD=Loopback,DEV=1,SUBDEV=0 ..."
-aplay -D plughw:CARD=Loopback,DEV=0 -r 44100 -c 2 some.wav   # plays from the NS7II master out
+aplay -L | grep -A1 ns7ii          # "ns7ii" / "Numark NS7II Audio Controller"
+aplay -D ns7ii -r 44100 -c 2 some.wav   # plays from the NS7II master out
 ```
 
 What the journal shows, and how to watch a problem:

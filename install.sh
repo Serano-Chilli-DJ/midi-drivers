@@ -1,7 +1,8 @@
 #!/bin/sh
 # Install (or remove) the ns7iid driver: binary, udev rule, systemd service,
-# its start helper and settings, and the snd-aloop "Loopback" card that DJ
-# apps play into. Safe to run again (an update keeps /etc/default/ns7iid).
+# its start helper and settings, the snd-aloop "Loopback" card that DJ
+# apps play into, and the ALSA device name "ns7ii" for its app end. Safe to
+# run again (an update keeps /etc/default/ns7iid).
 # Usage: sudo ./install.sh [path/to/ns7iid-binary]   (default: dist/ns7iid-$(uname -m))
 #        sudo ./install.sh --uninstall
 set -e
@@ -14,12 +15,13 @@ RULE=/etc/udev/rules.d/99-numark-ns7ii.rules
 DEFAULTS=/etc/default/ns7iid
 MODLOAD=/etc/modules-load.d/ns7ii.conf
 MODPROBE=/etc/modprobe.d/ns7ii-aloop.conf
+ALSACONF=/etc/alsa/conf.d/50-ns7ii.conf
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
 if [ "$1" = --uninstall ]; then
     systemctl stop ns7iid.service 2>/dev/null || true
-    rm -f "$UNIT" "$RULE" "$HELPER" "$BIN" "$MODLOAD" "$MODPROBE"
+    rm -f "$UNIT" "$RULE" "$HELPER" "$BIN" "$MODLOAD" "$MODPROBE" "$ALSACONF"
     if [ -f "$DEFAULTS" ]; then
         if cmp -s "$DEFAULTS" "$here/systemd/ns7iid.default"; then
             rm -f "$DEFAULTS"
@@ -43,6 +45,7 @@ install -m644 "$here/udev/99-numark-ns7ii.rules" "$RULE"
 install -m644 "$here/systemd/ns7iid.service" "$UNIT"
 install -D -m644 "$here/modules/ns7ii-modules-load.conf" "$MODLOAD"
 install -D -m644 "$here/modules/ns7ii-aloop.conf" "$MODPROBE"
+install -D -m644 "$here/alsa/50-ns7ii.conf" "$ALSACONF"
 if [ -e "$DEFAULTS" ]; then
     echo "keeping existing $DEFAULTS (new template: $here/systemd/ns7iid.default)"
 else
@@ -64,7 +67,8 @@ done
 
 echo "installed. The driver starts automatically when the NS7II is plugged in,"
 echo "bridging audio to the ALSA card 'Loopback'. Point the DJ app at"
-echo "  plughw:CARD=Loopback,DEV=0   (output and input)"
+echo "  ns7ii   \"Numark NS7II Audio Controller\"   (output and input;"
+echo "          the same device as plughw:CARD=Loopback,DEV=0,SUBDEV=0)"
 echo "and the 'Numark NS7II' MIDI port."
 echo "  systemctl status ns7iid     # is it running?"
 echo "  journalctl -u ns7iid -f     # its log"
