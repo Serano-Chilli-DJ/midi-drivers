@@ -11,3 +11,9 @@ with its own build, docs and installer.
 Each driver's README covers building, installing and verifying it on
 hardware. The vendor packages a driver was reconstructed from are kept
 untracked under its `tmp/`.
+
+## License
+
+GPL-2.0-or-later: see [LICENSE](LICENSE). Version 2 rather than 3 so the
+code stays compatible with the Linux kernel, should any of these drivers
+move in-tree or borrow from one that is.
